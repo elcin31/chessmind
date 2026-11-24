@@ -43,7 +43,7 @@ class ProjectionTest {
                 press(ui, shareMode)
                 select(ui, "Entire screen", "Share entire screen")
             }
-            select(ui, "Start now", "Start recording", "Share")
+            select(ui, "Start now", "Start", "Start recording", "Share")
             await("первая подсказка", 25_000) {
                 CaptureGate.running.value && CaptureGate.status.value.startsWith("Лучший ход")
             }
