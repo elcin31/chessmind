@@ -1,0 +1,11 @@
+ChessMind 1.0 and Stockfish 17.1 are distributed under GNU GPL version 3.
+Stockfish is Copyright (C) The Stockfish developers.
+
+Complete corresponding source and build scripts:
+https://github.com/elcin31/chessmind/releases/tag/v1.0.0
+
+Stockfish source revision:
+https://github.com/official-stockfish/Stockfish/tree/03e27488f3d21d8ff4dbf3065603afa21dbd0ef3
+
+Kotlin, kotlinx.coroutines, AndroidX and Jetpack Compose are distributed under Apache License 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
