@@ -94,7 +94,7 @@ class ProjectionTest {
         for (index in 0 until node.childCount) node.getChild(index)?.let { yieldAll(tree(it)) }
     }
 
-    private fun label(node: AccessibilityNodeInfo): String = (node.text ?: node.contentDescription).orEmpty().toString()
+    private fun label(node: AccessibilityNodeInfo): String = (node.text ?: node.contentDescription)?.toString().orEmpty()
 
     private fun await(description: String, timeout: Long = 10_000, condition: () -> Boolean) {
         val until = SystemClock.elapsedRealtime() + timeout

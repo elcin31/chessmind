@@ -4,11 +4,11 @@ ChessMind — русскоязычный офлайн-ассистент для 
 
 ## Установка
 
-1. Скачайте `ChessMind-1.0.apk` на странице релиза. Архив `ChessMind-1.0-APK.zip` содержит тот же APK.
+1. Возьмите `ChessMind-1.0.apk` из комплекта ChessMind 1.0. Архив `ChessMind-1.0-APK.zip` содержит тот же APK.
 2. Откройте файл на устройстве с Android 10 или новее. Если Android запросит разрешение на установку из этого источника, выдайте его приложению, из которого открыли файл.
 3. После установки запустите ChessMind. Доступны ARM64 и x86_64.
 
-[Скачать ChessMind 1.0](https://github.com/elcin31/chessmind/releases/tag/v1.0.0)
+[Исходники версии ChessMind 1.0](https://github.com/elcin31/chessmind/releases/tag/v1.0.0)
 
 При установке через USB используйте:
 
@@ -48,7 +48,7 @@ sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'plat
 ./gradlew :app:assembleRelease
 ```
 
-Сборка скачивает две официальные сети NNUE и проверяет их SHA-256. Для сборки с уже скачанными сетями задайте `STOCKFISH_NETWORK_DIR`. Исходный ZIP релиза содержит обе сети в `third_party/networks`. Gradle-зависимости загружаются из Google Maven и Maven Central.
+Сборка скачивает две официальные сети NNUE и проверяет их SHA-256. Для сборки с уже скачанными сетями задайте `STOCKFISH_NETWORK_DIR`. Полный исходный ZIP из комплекта ChessMind 1.0 содержит обе сети в `third_party/networks`. При сборке из этого архива можно задать `STOCKFISH_NETWORK_DIR="$PWD/third_party/networks"`. Gradle-зависимости загружаются из Google Maven и Maven Central.
 
 Gradle создаёт подписанный отладочный APK в `app/build/outputs/apk/debug/` и неподписанный релизный APK в `app/build/outputs/apk/release/`. Для распространения собственной сборки подпишите её своим ключом с помощью `apksigner`. Обновление установленного APK требует того же ключа.
 
