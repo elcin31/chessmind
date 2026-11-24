@@ -4,6 +4,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.os.SystemClock
+import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.chessmind.chess.Game
@@ -83,6 +84,21 @@ class DeviceTest {
             future.cancelAndJoin()
             assertTrue(SystemClock.elapsedRealtime() - cancelledAt < 1_500)
             assertNotNull(engine.analyze(game, settings).best)
+        } finally {
+            engine.close()
+        }
+    }
+
+    @Test fun measureWarmEngineBudgets() = runBlocking {
+        val engine = (InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as ChessMindApp).stockfish
+        val middle = Game.importPgn("1. e4 c5 2. Nf3 d6")
+        try {
+            engine.analyze(Game(), EngineSettings(pace = Pace.FAST))
+            for (pace in Pace.entries) {
+                val result = engine.analyze(middle, EngineSettings(pace = pace))
+                assertTrue(middle.position.legalMoves().any { it.uci == result.best })
+                Log.i("ChessMindBenchmark", "${pace.name} ${result.milliseconds} ms, depth ${result.variations.firstOrNull()?.depth}")
+            }
         } finally {
             engine.close()
         }
