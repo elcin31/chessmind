@@ -7,10 +7,13 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
-internal interface RgbFrame {
+internal fun interface ColorSource {
+    fun pixel(x: Int, y: Int): Int
+}
+
+internal interface RgbFrame : ColorSource {
     val width: Int
     val height: Int
-    fun pixel(x: Int, y: Int): Int
 }
 
 internal data class Calibration(val x: Float = 0f, val y: Float = 0f, val zoom: Float = 0f)
@@ -61,7 +64,7 @@ internal class Recognizer {
             scheme = current
             templates.clear()
         }
-        val grid = if (reduced || cell < 37) 12 else 18
+        val grid = if (reduced || cell < 37) 16 else 20
         val sample = IntArray(grid * grid)
         val position = StringBuilder(64)
         var confidence = 1f
@@ -75,8 +78,8 @@ internal class Recognizer {
             val step = area.size / 8
             if (distance(frame.pixel((leftCell + step * .12f).toInt(), (topCell + step * .12f).toInt()), background) > 45)
                 return null
-            sampleInto(sample, grid, leftCell, topCell, step, frame::pixel)
-            val options = templates.getOrPut(isLight to (grid == 12)) { createTemplates(grid, background, set) }
+            sampleInto(sample, grid, leftCell, topCell, step, frame)
+            val options = templates.getOrPut(isLight to (grid == 16)) { createTemplates(grid, background, set) }
             var best = Int.MAX_VALUE
             var next = Int.MAX_VALUE
             var symbol = '.'
@@ -93,8 +96,8 @@ internal class Recognizer {
             }
             val error = best / (3f * sample.size)
             val margin = (next - best) / (3f * sample.size)
-            if (error > 22f || margin < 3.2f) return null
-            confidence = minOf(confidence, (1f - error / 40f) * (margin / 8f).coerceAtMost(1f))
+            if (error > 20f || margin < 2.7f) return null
+            confidence = minOf(confidence, (1f - error / 48f) * (margin / 6f).coerceAtMost(1f))
             position.append(symbol)
         }
         return ObservedBoard(position.toString(), confidence)
@@ -104,24 +107,55 @@ internal class Recognizer {
         val size = 96
         val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
+        val source = ColorSource(bitmap::getPixel)
         return try {
             BoardArt.PIECES.map { piece ->
                 BoardArt.drawCell(canvas, 0f, 0f, size.toFloat(), background, piece, set)
-                IntArray(grid * grid).also { sampleInto(it, grid, 0f, 0f, size.toFloat(), bitmap::getPixel) }
+                IntArray(grid * grid).also { sampleInto(it, grid, 0f, 0f, size.toFloat(), source) }
             }
         } finally {
             bitmap.recycle()
         }
     }
 
-    private fun sampleInto(output: IntArray, grid: Int, x: Float, y: Float, size: Float, pixel: (Int, Int) -> Int) {
+    private fun sampleInto(output: IntArray, grid: Int, x: Float, y: Float, size: Float, source: ColorSource) {
+        // Compare low-pass samples so a thin outline does not move between bins after downscaling.
+        val radius = size * .0224f
         for (row in 0 until grid) {
-            val sy = (y + size * (.115f + .77f * (row + .5f) / grid)).toInt()
+            val centerY = y + size * (.115f + .77f * (row + .5f) / grid) - .5f
             for (col in 0 until grid) {
-                val sx = (x + size * (.115f + .77f * (col + .5f) / grid)).toInt()
-                output[row * grid + col] = pixel(sx, sy)
+                val centerX = x + size * (.115f + .77f * (col + .5f) / grid) - .5f
+                val redGreenBlue = averageRgb(centerX, centerY, radius, source)
+                output[row * grid + col] = redGreenBlue
             }
         }
+    }
+
+    private fun averageRgb(x: Float, y: Float, radius: Float, source: ColorSource): Int {
+        var red = 0f
+        var green = 0f
+        var blue = 0f
+        for (row in -1..1) {
+            val sampleY = y + row * radius
+            val iy = sampleY.toInt()
+            val wy = sampleY - iy
+            for (col in -1..1) {
+                val sampleX = x + col * radius
+                val ix = sampleX.toInt()
+                val wx = sampleX - ix
+                for (dy in 0..1) {
+                    val vertical = if (dy == 0) 1f - wy else wy
+                    for (dx in 0..1) {
+                        val weight = vertical * if (dx == 0) 1f - wx else wx
+                        val color = source.pixel(ix + dx, iy + dy)
+                        red += (color shr 16 and 255) * weight
+                        green += (color shr 8 and 255) * weight
+                        blue += (color and 255) * weight
+                    }
+                }
+            }
+        }
+        return ((red / 9).roundToInt() shl 16) or ((green / 9).roundToInt() shl 8) or (blue / 9).roundToInt()
     }
 
     private fun locate(frame: RgbFrame, colors: List<Int>): List<Point>? {
@@ -143,14 +177,35 @@ internal class Recognizer {
             }
         }
         if (count.any { it == 0 }) return null
-        val points = colors.indices.map { Point(sumX[it].toFloat() / count[it], sumY[it].toFloat() / count[it]) }
+        val points = colors.indices.map { index ->
+            val x = sumX[index].toFloat() / count[index]
+            val y = sumY[index].toFloat() / count[index]
+            refinePoint(frame, x.roundToInt(), y.roundToInt(), step * 3, colors[index])
+                ?: return null
+        }
         return points.takeIf { validMarkers(frame, it, colors) }
+    }
+
+    private fun refinePoint(frame: RgbFrame, x: Int, y: Int, radius: Int, color: Int): Point? {
+        var sumX = 0f
+        var sumY = 0f
+        var count = 0
+        for (row in (y - radius).coerceAtLeast(0)..(y + radius).coerceAtMost(frame.height - 1)) {
+            for (col in (x - radius).coerceAtLeast(0)..(x + radius).coerceAtMost(frame.width - 1)) {
+                if (distance(frame.pixel(col, row), color) <= 9) {
+                    sumX += col + .5f
+                    sumY += row + .5f
+                    count++
+                }
+            }
+        }
+        return if (count > 0) Point(sumX / count, sumY / count) else null
     }
 
     private fun validMarkers(frame: RgbFrame, points: List<Point>, colors: List<Int>): Boolean =
         points.indices.all { index ->
-            val x = points[index].x.roundToInt()
-            val y = points[index].y.roundToInt()
+            val x = points[index].x.toInt()
+            val y = points[index].y.toInt()
             x in 0 until frame.width && y in 0 until frame.height && distance(frame.pixel(x, y), colors[index]) <= 12
         }
 }

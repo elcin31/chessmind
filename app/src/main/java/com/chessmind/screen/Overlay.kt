@@ -27,6 +27,7 @@ internal class Overlay(context: Context, stop: () -> Unit) {
         PixelFormat.TRANSLUCENT
     ).apply {
         gravity = Gravity.TOP or Gravity.START
+        title = "ChessMind"
         x = dp(14)
         y = dp(14)
     }
