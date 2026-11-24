@@ -1,5 +1,6 @@
 package com.chessmind.ui
 
+import android.content.ClipData
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -10,8 +11,8 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -24,6 +25,7 @@ import com.chessmind.engine.sanLine
 import com.chessmind.engine.scoreText
 import com.chessmind.screen.Calibration
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
@@ -142,8 +144,11 @@ internal fun AnalysisPage(state: ChessState, model: ChessViewModel, openManual: 
     }
     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         TextButton(onClick = model::flip) { Text("Развернуть") }
-        val clipboard = LocalClipboardManager.current
-        TextButton(onClick = { clipboard.setText(AnnotatedString(position.fen)) }) { Text("Копировать FEN") }
+        val clipboard = LocalClipboard.current
+        val scope = rememberCoroutineScope()
+        TextButton(onClick = {
+            scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("FEN", position.fen))) }
+        }) { Text("Копировать FEN") }
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Button(model::analyze, enabled = !state.busy && state.result == null) { Text("Рассчитать") }

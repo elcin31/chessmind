@@ -26,7 +26,7 @@ internal class Overlay(context: Context, stop: () -> Unit) {
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
         PixelFormat.TRANSLUCENT
     ).apply {
-        gravity = Gravity.TOP or Gravity.LEFT
+        gravity = Gravity.TOP or Gravity.START
         x = dp(14)
         y = dp(14)
     }
@@ -84,7 +84,7 @@ internal class Overlay(context: Context, stop: () -> Unit) {
             layout()
         }, { params.x to params.y }))
         resizeHandle.setOnTouchListener(gesture({ dx, dy, initialWidth, initialHeight ->
-            val bounds = manager.currentWindowMetrics.bounds
+            val bounds = manager.displayBounds()
             expandedWidth = (initialWidth + dx).coerceIn(dp(185), maxOf(dp(185), bounds.width()))
             expandedHeight = (initialHeight + dy).coerceIn(dp(145), maxOf(dp(145), bounds.height()))
             params.width = expandedWidth
@@ -115,7 +115,7 @@ internal class Overlay(context: Context, stop: () -> Unit) {
     }
 
     private fun constrain() {
-        val bounds = manager.currentWindowMetrics.bounds
+        val bounds = manager.displayBounds()
         params.width = params.width.coerceAtMost(bounds.width())
         params.height = params.height.coerceAtMost(bounds.height())
         params.x = params.x.coerceIn(0, (bounds.width() - params.width).coerceAtLeast(0))

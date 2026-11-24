@@ -120,7 +120,7 @@ class AssistantService : Service() {
             val capture = checkNotNull(manager.getMediaProjection(result, data))
             projection = capture
             capture.registerCallback(callbacks, main)
-            val bounds = getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds
+            val bounds = getSystemService(WindowManager::class.java).displayBounds(maximum = true)
             resize(bounds.width(), bounds.height())
             overlay = Overlay(this) { finish("Экранный ассистент выключен") }
             CaptureGate.running.value = true
