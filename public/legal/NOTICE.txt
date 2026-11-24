@@ -1,0 +1,19 @@
+ChessMind 1.0 — GNU GPL v3 or later.
+Application source: https://github.com/elcin31/chessmind
+
+Stockfish 19 WASM, stockfish npm 19.0.1, lite single-threaded and multithreaded builds.
+GPL v3. License: /engine/Copying.txt.
+Corresponding engine source, build scripts and network files:
+https://github.com/nmrugg/stockfish.js/releases/tag/v19.0.1
+https://github.com/nmrugg/stockfish.js
+https://github.com/official-stockfish/Stockfish
+
+Cburnett SVG chess pieces, Colin M. L. Burnett, GPL v2 or later.
+Source: https://github.com/lichess-org/lila/tree/3e5aeef9b54c9a3a6637b57650420f67da26f57e/public/piece/cburnett
+License: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
+Lichess chess-openings, CC0 1.0. License: /legal/eco.txt.
+Source: https://github.com/lichess-org/chess-openings/tree/48a8c0e733facfdc9a3723fe882e51ec28014074
+
+chess.js BSD-2-Clause, React and idb MIT, Lucide ISC and MIT.
+Full dependency notices: /legal/dependencies.txt.

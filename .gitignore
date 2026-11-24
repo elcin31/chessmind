@@ -1,10 +1,6 @@
-.gradle/
-.kotlin/
-.idea/
-**/build/
-local.properties
-*.iml
-*.jks
-/dist/
-/.local-signing/
-/third_party/networks/
+node_modules/
+dist/
+public/engine/
+public/eco.json
+.vercel/
+public/legal/dependencies.txt
