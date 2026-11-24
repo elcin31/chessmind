@@ -43,7 +43,20 @@ internal fun RoundPage(state: ChessState, model: ChessViewModel, running: Boolea
     }
     var calibrationOpen by rememberSaveable { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        TextButton(onClick = model::closeRound, contentPadding = PaddingValues(0.dp)) { Text("←  Выйти из партии") }
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextButton(onClick = model::closeRound, contentPadding = PaddingValues(0.dp)) { Text("←  Выйти из партии") }
+            if (round == Round.ASSISTED) {
+                FilledTonalButton(
+                    onClick = if (running) stopAssistant else requestAssistant,
+                    enabled = state.outcome == null || running,
+                    contentPadding = PaddingValues(horizontal = 11.dp),
+                ) { Text(if (running) "Остановить захват" else "Включить захват экрана", fontSize = 12.sp) }
+            }
+        }
         PageTitle(round.label, status)
     }
 
@@ -61,11 +74,6 @@ internal fun RoundPage(state: ChessState, model: ChessViewModel, running: Boolea
     }
 
     if (round == Round.ASSISTED) {
-        Button(
-            onClick = if (running) stopAssistant else requestAssistant,
-            enabled = state.outcome == null || running,
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text(if (running) "Остановить захват" else "Включить захват экрана") }
         Text(captureStatus.lineSequence().first(), color = Muted, fontSize = 13.sp)
         if (running) {
             TextButton(onClick = { calibrationOpen = !calibrationOpen }) {
