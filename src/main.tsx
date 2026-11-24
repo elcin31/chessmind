@@ -1,17 +1,20 @@
 import { createRoot } from 'react-dom/client'
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_POSITION } from 'chess.js'
 import { Activity, ArrowDownToLine, ArrowRight, BookOpen, ChartNoAxesCombined, CircleHelp, Cpu, FolderOpen, House, List, MonitorDown, Settings2, ShieldCheck, Target, Upload, Zap } from 'lucide-react'
 import { Board } from './Board'
 import { ImportForm } from './Import'
-import { Methodology } from './Methodology'
 import { Empty, percent, ReviewScreen } from './ReviewScreen'
-import { Openings, Statistics } from './Stats'
-import { Training } from './Training'
-import { budgets } from './engine'
-import { db, displayDate, isComplete, parsePgn, playerColor, timeLabel, type Game, type Mode, type Practice } from './library'
+import { budgets, trimCache } from './engine'
+import { analysisKey, db, methodologyVersion, displayDate, isComplete, parsePgn, playerColor, timeLabel, type Analysis, type EngineOptions, type Game, type Mode, type Practice } from './library'
 import { analyzeGame, categories, summarize, type Line, type Review } from './review'
 import './style.css'
+
+const Methodology = lazy(() => import('./Methodology').then(module => ({ default: module.Methodology })))
+const Training = lazy(() => import('./Training').then(module => ({ default: module.Training })))
+const Statistics = lazy(() => import('./Stats').then(module => ({ default: module.Statistics })))
+const Openings = lazy(() => import('./Stats').then(module => ({ default: module.Openings })))
+const Endgames = lazy(() => import('./Endgames').then(module => ({ default: module.Endgames })))
 
 const pages = {
   home: { label: 'Главная', icon: House, title: 'Рабочий стол', subtitle: '' },
@@ -20,13 +23,14 @@ const pages = {
   training: { label: 'Тренировки', icon: Target, title: 'Тренажёр ошибок', subtitle: 'Практика на позициях из ваших партий' },
   stats: { label: 'Статистика', icon: ChartNoAxesCombined, title: 'Статистика игрока', subtitle: 'Результаты и качество игры' },
   openings: { label: 'Дебюты', icon: BookOpen, title: 'Дебюты', subtitle: 'Энциклопедия ECO и ваша дебютная практика' },
+  endgames: { label: 'Эндшпили', icon: Target, title: 'Эндшпильная лаборатория', subtitle: 'Позиции из завершённых партий' },
   settings: { label: 'Настройки', icon: Settings2, title: 'Настройки', subtitle: 'Профиль, анализ и локальные данные' },
   methodology: { label: 'Методология', icon: CircleHelp, title: 'Методология', subtitle: 'Формулы, допущения и источники' },
 }
 type Page = keyof typeof pages
-type Settings = { nickname: string; theme: 'system' | 'light' | 'dark'; mode: Mode }
+type Settings = { nickname: string; theme: 'system' | 'light' | 'dark'; mode: Mode; engine?: EngineOptions; board?: 'sage' | 'navy' | 'gold' }
 const core: Page[] = ['home', 'games', 'review', 'training', 'stats']
-const secondary: Page[] = ['openings', 'settings', 'methodology']
+const secondary: Page[] = ['openings', 'endgames', 'settings', 'methodology']
 
 function loadSettings(): Settings {
   try { return { nickname: '', theme: 'system', mode: 'standard', ...JSON.parse(localStorage.getItem('chessmind-settings') || '{}') } }
@@ -52,6 +56,7 @@ function App() {
   const [settings, setSettings] = useState(loadSettings)
   const [games, setGames] = useState<Game[]>([])
   const [practice, setPractice] = useState<Practice[]>([])
+  const [eta, setEta] = useState<number>()
   const [active, setActive] = useState<string>()
   const [status, setStatus] = useState('')
   const [offline, setOffline] = useState(false)
@@ -59,7 +64,7 @@ function App() {
   const [visible, setVisible] = useState(!document.hidden)
   const current = useRef<{ id: string; controller: AbortController } | undefined>(undefined)
   const state = pages[location.page]
-  const sorted = [...games].sort((first, second) => second.date.localeCompare(first.date))
+  const sorted = useMemo(() => [...games].sort((first, second) => second.date.localeCompare(first.date) || (second.timestamp ?? 0) - (first.timestamp ?? 0)), [games])
   const selected = games.find(game => game.id === location.id) ?? sorted[0]
 
   useEffect(() => {
@@ -78,6 +83,7 @@ function App() {
   }, [])
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme
+    document.documentElement.dataset.board = settings.board ?? 'sage'
     localStorage.setItem('chessmind-settings', JSON.stringify(settings))
   }, [settings])
   useEffect(() => {
@@ -107,17 +113,25 @@ function App() {
   }
   useEffect(() => {
     if (!visible || current.current || active) return
-    const pending = games.find(game => game.queued && !isComplete(game))
+    const pending = games.filter(game => game.queued).sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0))[0]
     if (!pending) return
     const controller = new AbortController()
     current.current = { id: pending.id, controller }
     setActive(pending.id)
+    setEta(undefined)
     const run = async () => {
-      const latest = await (await db).get('games', pending.id)
-      if (!latest?.queued || isComplete(latest)) return mergeGame(latest)
+      let latest = await (await db).get('games', pending.id)
+      if (!latest?.queued || controller.signal.aborted) return mergeGame(latest)
+      if (latest.methodology !== 2) latest = await patchGame(latest.id, prepareAnalysis(latest, latest.mode ?? 'standard', settings.engine))
+      if (!latest) return
+      const started = performance.now()
+      const existing = latest.reviews?.length ?? 0
+      const { id, moves } = latest
       try {
         await analyzeGame(latest, latest.mode ?? 'standard', controller.signal, async reviews => {
-          mergeGame(await patchGame(latest.id, { reviews, ...(reviews.length === latest.moves ? { queued: false } : {}) }))
+          const seconds = (performance.now() - started) / 1000
+          if (reviews.length - existing >= 3) setEta(Math.ceil(seconds * (moves - reviews.length) / (reviews.length - existing)))
+          mergeGame(await patchGame(id, { reviews, ...(reviews.length === moves ? { queued: false } : {}) }))
         })
       } catch (error) {
         if (!controller.signal.aborted) {
@@ -135,11 +149,25 @@ function App() {
 
   function open(game: Game, ply?: number) { window.location.hash = 'review/' + game.id + (ply ? '/' + ply : '') }
   function go(page: Page) { window.location.hash = page }
-  async function queue(game: Game, mode: Mode) {
+  async function queueBatch(items: Game[], mode: Mode) {
     setStatus('')
-    try { mergeGame(await patchGame(game.id, { queued: true, mode, ...(game.mode !== mode ? { reviews: [] } : {}) })) }
-    catch { setStatus('Не удалось сохранить очередь анализа.') }
+    try {
+      const tx = (await db).transaction('games', 'readwrite')
+      const changed = new Map<string, Game>()
+      const queuedAt = Date.now()
+      for (const [index, item] of items.entries()) {
+        const latest = await tx.store.get(item.id)
+        if (!latest || latest.queued) continue
+        const updated = { ...latest, ...prepareAnalysis(latest, mode, settings.engine), queuedAt: queuedAt + index }
+        if (isComplete(updated)) updated.queued = false
+        await tx.store.put(updated)
+        changed.set(updated.id, updated)
+      }
+      await tx.done
+      setGames(previous => previous.map(game => changed.get(game.id) ?? game))
+    } catch { setStatus('Не удалось сохранить очередь анализа.') }
   }
+  function queue(game: Game, mode: Mode) { return queueBatch([game], mode) }
   async function pause(game: Game) {
     try {
       mergeGame(await patchGame(game.id, { queued: false }))
@@ -159,7 +187,7 @@ function App() {
       <a href="#home" className="brand"><img src="/icon.svg" width="43" height="43" alt="" /><div>Chess<span>Mind</span><small>АНАЛИЗ ПАРТИЙ</small></div></a>
       <nav aria-label="Основные разделы" className="main-nav">{navigation(core)}</nav>
       <nav aria-label="Дополнительные разделы" className="secondary-nav">{navigation(secondary)}</nav>
-      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 1.0</small></div>
+      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0</small></div>
     </aside>
     <main>
       <header className="topbar">
@@ -175,12 +203,19 @@ function App() {
         {location.page !== 'home' && <div className="page-heading"><h1>{state.title}</h1><p>{state.subtitle}</p></div>}
         {status && <div className="notice bad banner" role="alert">{status}<button onClick={() => setStatus('')}>Закрыть</button></div>}
         {update && <div className="notice banner">Доступна новая сборка ChessMind.<button disabled={!!active} onClick={() => {
-          navigator.serviceWorker.addEventListener('controllerchange', () => window.location.reload(), { once: true })
-          update.postMessage('activate-update')
+          const activate = () => new Promise<void>(resolve => {
+            navigator.serviceWorker.addEventListener('controllerchange', () => { resolve(); window.location.reload() }, { once: true })
+            update.postMessage('activate-update')
+          })
+          if (navigator.locks) void navigator.locks.request('chessmind-queue', { ifAvailable: true }, lock => {
+            if (lock) return activate()
+            setStatus('Анализ идёт в другой вкладке. Обновление станет доступно после завершения.')
+          })
+          else void activate()
         }}>Обновить</button></div>}
         {location.page === 'home' && <>
           <section className="hero">
-            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 1.0</div>
+            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0</div>
               <h1>Разбор шахматных<br className="desktop-break" /> партий</h1>
               <p>Найдите переломные ходы, проверьте варианты Stockfish и потренируйтесь на собственных ошибках.</p>
               <div className="hero-actions"><a className="primary" href="#games"><ArrowDownToLine size={18} /> Добавить партию</a>
@@ -203,20 +238,23 @@ function App() {
           </div>
           <footer className="home-footer"><span><Cpu size={16} /> Все расчёты на вашем устройстве</span><span><Zap size={16} /> Бесплатно и без лимитов</span><span><MonitorDown size={16} /> Устанавливается как приложение</span></footer>
         </>}
-        {location.page === 'games' && <>{importForm}<GameList games={sorted} nickname={settings.nickname} open={open} /></>}
-        {location.page === 'review' && <ReviewScreen key={(selected?.id ?? '') + ':' + (location.ply ?? 0)} game={selected} initialPly={location.ply} games={games} nickname={settings.nickname} mode={settings.mode} active={active} onQueue={queue} onPause={pause} onImport={() => go('games')} />}
+        {location.page === 'games' && <>{importForm}<GameList games={sorted} nickname={settings.nickname} open={open} queue={items => void queueBatch(items, settings.mode)} /></>}
+        {location.page === 'review' && <ReviewScreen key={(selected?.id ?? '') + ':' + (location.ply ?? 0)} game={selected} initialPly={location.ply} games={games} nickname={settings.nickname} mode={settings.mode} active={active} eta={eta} options={settings.engine} onQueue={queue} onPause={pause} onImport={() => go('games')} />}
+        <Suspense fallback={<p role="status">Загружаем раздел…</p>}>
         {location.page === 'training' && <Training games={games} nickname={settings.nickname} practice={practice} onPractice={item => setPractice(old => [...old.filter(entry => entry.id !== item.id), item])} onImport={() => go('games')} />}
         {location.page === 'stats' && <Statistics games={games} nickname={settings.nickname} open={open} />}
         {location.page === 'openings' && <Openings games={games} nickname={settings.nickname} open={open} />}
+        {location.page === 'endgames' && <Endgames games={games} open={open} />}
         {location.page === 'settings' && <Preferences settings={settings} onSettings={setSettings} setGames={setGames} setPractice={setPractice} offline={offline} />}
         {location.page === 'methodology' && <Methodology />}
+        </Suspense>
       </div>
     </main>
     <nav className="bottom-nav" aria-label="Основные разделы">{navigation(core)}</nav>
   </div>
 }
 
-function GameList({ games, nickname, open }: { games: Game[]; nickname: string; open: (game: Game) => void }) {
+function GameList({ games, nickname, open, queue }: { games: Game[]; nickname: string; open: (game: Game) => void; queue: (games: Game[]) => void }) {
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('')
   const [source, setSource] = useState('')
@@ -239,6 +277,7 @@ function GameList({ games, nickname, open }: { games: Game[]; nickname: string; 
       <select value={result} onChange={e => setResult(e.target.value)} aria-label="Результат"><option value="">Результат</option><option>1-0</option><option>0-1</option><option>1/2-1/2</option></select>
       <select value={order} onChange={e => setOrder(e.target.value)} aria-label="Сортировка"><option value="new">Сначала новые</option><option value="old">Сначала старые</option><option value="long">По длине</option></select>
     </div>
+    {shown.some(game => !isComplete(game) && !game.queued) && <button onClick={() => queue(shown.filter(game => !isComplete(game) && !game.queued))}>Добавить в очередь партии без полного анализа</button>}
     {!shown.length && <Empty title={games.length ? 'Партии не найдены' : 'Библиотека пуста'} message={games.length ? 'Измените параметры поиска.' : 'Выберите источник импорта выше.'} />}
     <div className="game-rows">{shown.slice(0, limit).map(game => {
       const side = playerColor(game, nickname)
@@ -258,10 +297,36 @@ function GameList({ games, nickname, open }: { games: Game[]; nickname: string; 
   </section>
 }
 
+function prepareAnalysis(game: Game, mode: Mode, options?: EngineOptions): Partial<Game> {
+  const next = { mode, options, methodology: methodologyVersion } as const
+  if (analysisKey(game) === analysisKey(next)) return { ...next, queued: true }
+  const key = analysisKey(next)
+  const saved = game.savedAnalyses ?? []
+  const snapshot = saved.find(item => analysisKey(item) === key)
+  const prior: Analysis[] = game.reviews?.length && game.mode ? [{
+    mode: game.mode, methodology: game.methodology, options: game.options, reviews: game.reviews,
+  }] : []
+  return {
+    ...next, queued: true, reviews: snapshot?.reviews ?? [],
+    savedAnalyses: [...saved.filter(item => ![key, analysisKey(game)].includes(analysisKey(item))), ...prior],
+  }
+}
+
 function validLine(value: Line) {
   return value && ['mate', 'cp'].includes(value.kind) && Number.isFinite(value.value) && Number.isFinite(value.depth) &&
     Array.isArray(value.pv) && value.pv.every(move => /^[a-h][1-8][a-h][1-8][qrbn]?$/.test(move)) &&
     (!value.wdl || Array.isArray(value.wdl) && value.wdl.length === 3 && value.wdl.every(Number.isFinite))
+}
+
+function readEngineOptions(value?: EngineOptions): EngineOptions | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  return {
+    full: value.full === true,
+    multiplier: [0.5, 1, 2, 3].includes(value.multiplier ?? 0) ? value.multiplier : undefined,
+    threads: value.threads === 1 ? 1 : undefined,
+    hash: value.hash === 32 || value.hash === 64 ? value.hash : undefined,
+    cache: [0, 500, 3000, 6000].includes(value.cache ?? -1) ? value.cache : undefined,
+  }
 }
 
 function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
@@ -271,7 +336,9 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
   async function backup() {
     try {
       const storage = await db
-      const snapshot = { version: 1, games: await storage.getAll('games'), practice: await storage.getAll('practice'), settings }
+      const snapshot = { version: 2, games: await storage.getAll('games'), practice: await storage.getAll('practice'), settings,
+        repertoire: JSON.parse(localStorage.getItem('chessmind-repertoire') ?? '{}'),
+        repertoireDue: JSON.parse(localStorage.getItem('chessmind-repertoire-due') ?? '{}') }
       const url = URL.createObjectURL(new Blob([JSON.stringify(snapshot)], { type: 'application/json' }))
       const link = document.createElement('a')
       link.href = url
@@ -284,26 +351,51 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
   async function restore(file: File) {
     try {
       const json = JSON.parse(await file.text())
-      if (json.version !== 1 || !Array.isArray(json.games) || !Array.isArray(json.practice)) throw new Error('Неверный формат резервной копии.')
+      if (![1, 2].includes(json.version) || !Array.isArray(json.games) || !Array.isArray(json.practice)) throw new Error('Неверный формат резервной копии.')
       const restored: Game[] = []
       for (const row of json.games as Game[]) {
         if (!['chesscom', 'lichess', 'pgn'].includes(row.source) || typeof row.pgn !== 'string') throw new Error('Копия содержит некорректную партию.')
-        const game = await parsePgn(row.pgn, row.source, typeof row.owner === 'string' ? row.owner : undefined)
+        const game = await parsePgn(row.pgn, row.source, typeof row.owner === 'string' ? row.owner : undefined, typeof row.url === 'string' ? row.url : undefined, row.methodology !== 2)
         if (row.id !== game.id) throw new Error('Контрольная сумма партии не совпадает.')
-        const reviews = row.reviews
-        if (reviews && (!Array.isArray(reviews) || reviews.length > game.moves || !reviews.every((item: Review, index: number) =>
+        const validReviews = (reviews: Review[]) => Array.isArray(reviews) && reviews.length <= game.moves && reviews.every((item, index) =>
           item.index === index && Object.hasOwn(categories, item.category) && ['w','b'].includes(item.color) &&
           ['opening','middle','end'].includes(item.phase) && [item.loss, item.accuracy, item.depth].every(Number.isFinite) &&
           (item.cpLoss === null || Number.isFinite(item.cpLoss)) && [item.before,item.after,item.played].every(validLine) &&
-          Array.isArray(item.lines) && item.lines.every(validLine) && typeof item.explanation === 'string'))) throw new Error('Копия содержит некорректный анализ.')
-        restored.push({ ...game, mode: row.mode && Object.hasOwn(budgets, row.mode) ? row.mode : undefined, reviews })
+          Array.isArray(item.lines) && item.lines.every(validLine) && typeof item.explanation === 'string')
+        if (row.reviews && !validReviews(row.reviews) || row.savedAnalyses && (!Array.isArray(row.savedAnalyses) ||
+          row.savedAnalyses.some(item => !Object.hasOwn(budgets, item.mode) || !validReviews(item.reviews)))) {
+          throw new Error('Копия содержит некорректный анализ.')
+        }
+        restored.push({ ...game, timestamp: Number.isFinite(row.timestamp) ? row.timestamp : game.timestamp,
+          mode: row.mode && Object.hasOwn(budgets, row.mode) ? row.mode : undefined, reviews: row.reviews,
+          methodology: row.methodology === 2 ? 2 : 1, options: readEngineOptions(row.options), savedAnalyses: row.savedAnalyses })
+
       }
       const storage = await db
       const known = new Set(restored.map(game => game.id))
       const tx = storage.transaction(['games','practice'], 'readwrite')
       for (const game of restored) {
         const previous = await tx.objectStore('games').get(game.id)
-        if (!previous || !previous.queued && (previous.reviews?.length ?? 0) < (game.reviews?.length ?? 0)) await tx.objectStore('games').put(game)
+        if (!previous) await tx.objectStore('games').put(game)
+        else {
+          const analyses = new Map((previous.savedAnalyses ?? []).map(item => [analysisKey(item), item]))
+          const existingKey = analysisKey(previous)
+          const imported = [...(game.savedAnalyses ?? []), ...(game.mode && game.reviews ? [{
+            mode: game.mode, methodology: game.methodology, options: game.options, reviews: game.reviews,
+          }] : [])]
+          let update = previous
+          for (const item of imported) {
+            const key = analysisKey(item)
+            if (key === existingKey) {
+              if (!previous.queued && item.reviews.length > (update.reviews?.length ?? 0)) update = { ...update, ...item }
+            } else if (item.reviews.length > (analyses.get(key)?.reviews.length ?? 0)) analyses.set(key, item)
+          }
+          if (!update.queued && !update.reviews?.length && game.reviews?.length) {
+            update = { ...update, mode: game.mode, methodology: game.methodology, options: game.options, reviews: game.reviews }
+            analyses.delete(analysisKey(update))
+          }
+          await tx.objectStore('games').put({ ...update, savedAnalyses: [...analyses.values()] })
+        }
       }
       for (const item of json.practice as Practice[]) {
         if (typeof item.id !== 'string' || !known.has(item.id.split(':')[0]) || ![item.correct,item.wrong,item.due,item.last,item.streak].every(value => Number.isFinite(value) && value >= 0)) continue
@@ -314,7 +406,20 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
       setGames(await storage.getAll('games'))
       setPractice(await storage.getAll('practice'))
       if (json.settings && typeof json.settings.nickname === 'string' && ['system','light','dark'].includes(json.settings.theme) && Object.hasOwn(budgets, json.settings.mode)) {
-        onSettings({ nickname: json.settings.nickname, theme: json.settings.theme, mode: json.settings.mode })
+        onSettings({ nickname: json.settings.nickname, theme: json.settings.theme, mode: json.settings.mode, engine: readEngineOptions(json.settings.engine),
+          board: ['sage', 'navy', 'gold'].includes(json.settings.board) ? json.settings.board : 'sage' })
+      }
+      if (json.repertoire && typeof json.repertoire === 'object' && !Array.isArray(json.repertoire)) {
+        const prior = JSON.parse(localStorage.getItem('chessmind-repertoire') ?? '{}')
+        const entries = Object.entries(json.repertoire).filter(([key, value]) =>
+          /^[wb]:[a-zA-Z0-9/]+ [wb] [KQkq-]+ [a-h1-8-]+$/.test(key) && typeof value === 'string' && value.length <= 12)
+        localStorage.setItem('chessmind-repertoire', JSON.stringify({ ...Object.fromEntries(entries), ...prior }))
+        const due = JSON.parse(localStorage.getItem('chessmind-repertoire-due') ?? '{}')
+        for (const [key] of entries) {
+          const time = json.repertoireDue?.[key]
+          if (Number.isFinite(time) && time >= 0) due[key] = Math.max(due[key] ?? 0, time)
+        }
+        localStorage.setItem('chessmind-repertoire-due', JSON.stringify(due))
       }
       setMessage('Резервная копия восстановлена.')
     } catch (error) { setMessage(error instanceof Error ? error.message : 'Не удалось восстановить данные.') }
@@ -325,9 +430,19 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
       <label className="field">Тема<select value={settings.theme} onChange={event => onSettings({ ...settings, theme: event.target.value as Settings['theme'] })}><option value="system">Системная</option><option value="light">Светлая</option><option value="dark">Тёмная</option></select></label>
       <label className="field">Режим анализа по умолчанию<select value={settings.mode} onChange={event => onSettings({ ...settings, mode: event.target.value as Mode })}>
         {Object.entries(budgets).map(([key, value]) => <option value={key} key={key}>{value.label}</option>)}</select></label>
-      <div className="action-row"><a href="#openings">Дебюты</a><a href="#methodology">Методология</a></div>
+      <label className="field">Цвет доски<select value={settings.board ?? 'sage'} onChange={event => onSettings({ ...settings, board: event.target.value as Settings['board'] })}><option value="sage">Шалфей</option><option value="navy">Тёмно-синий</option><option value="gold">Золотой</option></select></label>
+      <label className="field">Бюджет Professional<select value={settings.engine?.multiplier ?? 1} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, multiplier: Number(event.target.value) } })}>{[0.5, 1, 2, 3].map(value => <option key={value} value={value}>{value}×</option>)}</select></label>
+      <label className="field">Потоки Lite<select value={settings.engine?.threads ?? 'auto'} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, threads: event.target.value === '1' ? 1 : undefined } })}><option value="auto">Авто · до 2 потоков</option><option value="1">1 поток</option></select></label>
+      <label className="field">Память Stockfish Hash<select value={settings.engine?.hash ?? 16} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, hash: Number(event.target.value) as EngineOptions['hash'] } })}>{[16, 32, 64].map(value => <option key={value} value={value}>{value} МБ</option>)}</select></label>
+      <label className="action-row"><input type="checkbox" checked={settings.engine?.full ?? false} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, full: event.target.checked } })} /> Stockfish Full · около 95 МиБ при первом запуске</label>
+      <div className="action-row"><a href="#endgames">Эндшпили</a><a href="#openings">Дебюты</a><a href="#methodology">Методология</a></div>
     </section>
-    <section className="panel"><h2>Хранение и установка</h2><p>{offline ? 'Движок и интерфейс доступны офлайн.' : 'Офлайн-режим готовится при первом открытии опубликованного приложения.'}</p>
+    <section className="panel"><h2>Хранение и установка</h2>
+      <label className="field">Лимит кэша позиций<select value={settings.engine?.cache ?? 3000} onChange={event => {
+        const cache = Number(event.target.value)
+        onSettings({ ...settings, engine: { ...settings.engine, cache } })
+        void trimCache(cache).catch(() => setMessage('Не удалось очистить кэш позиций.'))
+      }}><option value={0}>Отключён</option>{[500, 3000, 6000].map(value => <option key={value} value={value}>{value} позиций</option>)}</select></label><p>{offline ? 'Движок и интерфейс доступны офлайн.' : 'Офлайн-режим готовится при первом открытии опубликованного приложения.'}</p>
       <p>На iPhone откройте ChessMind в Safari, нажмите «Поделиться», затем «На экран Домой» и «Добавить».</p>
       <p className="muted">Экспортируйте резервную копию перед очисткой данных браузера или переносом на другое устройство.</p>
       <div className="action-row"><button onClick={backup}><ArrowDownToLine size={16} /> Экспорт</button>

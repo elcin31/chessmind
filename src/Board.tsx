@@ -1,18 +1,34 @@
 import { Chess, type Color, type Move, type Square } from 'chess.js'
-import { useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 
 type Props = {
   fen: string; orientation?: Color; last?: Move; accent?: string; arrows?: string[];
+  onSwipe?: (direction: -1 | 1) => void
   onMove?: (from: Square, to: Square, promotion?: string) => void
 }
 
-export function Board({ fen, orientation = 'w', last, accent, arrows = [], onMove }: Props) {
+export function Board({ fen, orientation = 'w', last, accent, arrows = [], onSwipe, onMove }: Props) {
   const chess = useMemo(() => new Chess(fen), [fen])
   const [selection, select] = useState<{ fen: string; square: Square }>()
   const [promotion, promote] = useState<{ fen: string; from: Square; to: Square }>()
   const drag = useRef<{ square: Square; x: number; y: number; image: string } | undefined>(undefined)
   const ignoreClick = useRef(false)
   const [dragPreview, setDragPreview] = useState<{ x: number; y: number; image: string; square: Square }>()
+  const board = useRef<HTMLDivElement>(null)
+  const swipe = useRef<{ x: number; y: number }>(undefined)
+  useEffect(() => {
+    if (!last || !board.current || matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    const image = board.current.querySelector<HTMLImageElement>('[data-square="' + last.to + '"] img')
+    if (!image) return
+    const sign = orientation === 'w' ? 1 : -1
+    const dx = (last.from.charCodeAt(0) - last.to.charCodeAt(0)) * sign
+    const dy = (Number(last.to[1]) - Number(last.from[1])) * sign
+    const size = board.current.clientWidth / 8
+    image.closest('.square')?.animate([{ zIndex: 2 }, { zIndex: 2 }], { duration: 150 })
+    const motion = image.animate([{ transform: 'translate(' + dx * size + 'px,' + dy * size + 'px)' }, { transform: 'translate(0,0)' }],
+      { duration: 145, easing: 'ease-out' })
+    return () => motion.cancel()
+  }, [last, orientation])
   const id = useId().replace(/[^a-zA-Z0-9-]/g, '')
   const selected = selection?.fen === fen ? selection.square : undefined
   const choices = promotion?.fen === fen ? promotion : undefined
@@ -40,7 +56,16 @@ export function Board({ fen, orientation = 'w', last, accent, arrows = [], onMov
     const x = square.charCodeAt(0) - 97, y = 8 - Number(square[1])
     return orientation === 'w' ? [x + 0.5, y + 0.5] : [7.5 - x, 7.5 - y]
   }
-  return <div className="board" aria-label="Шахматная доска"
+  return <div ref={board} className="board" aria-label="Шахматная доска"
+    onTouchStart={event => { swipe.current = { x: event.touches[0].clientX, y: event.touches[0].clientY } }}
+    onTouchEnd={event => {
+      const start = swipe.current
+      swipe.current = undefined
+      if (!start || dragPreview) return
+      const dx = event.changedTouches[0].clientX - start.x
+      const dy = event.changedTouches[0].clientY - start.y
+      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.8) onSwipe?.(dx < 0 ? 1 : -1)
+    }}
     onPointerCancel={() => { drag.current = undefined; setDragPreview(undefined) }}
     onPointerMove={event => {
       const start = drag.current
@@ -61,7 +86,7 @@ export function Board({ fen, orientation = 'w', last, accent, arrows = [], onMov
     }}>
     {squares.map(({ piece, rank, file, square }, index) => <button key={square} type="button" data-square={square}
       tabIndex={onMove ? 0 : -1} aria-label={square + (piece ? ' ' + ({ k:'король', q:'ферзь', r:'ладья', b:'слон', n:'конь', p:'пешка' })[piece.type] + (piece.color === 'w' ? ' белые' : ' чёрные') : '')}
-      className={'square ' + ((rank + file) % 2 ? 'dark-square' : 'light-square') + (selected === square ? ' selected' : '')}
+      className={'square ' + (onMove && piece?.color === chess.turn() ? 'draggable ' : '') + ((rank + file) % 2 ? 'dark-square' : 'light-square') + (selected === square ? ' selected' : '')}
       style={last && (last.from === square || last.to === square) ? { boxShadow: 'inset 0 0 0 60px ' + (accent ?? '#dec677') + '88' } : undefined}
       onClick={() => tap(square)}
       onPointerDown={event => {

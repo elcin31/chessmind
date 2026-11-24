@@ -1,11 +1,13 @@
 import { Chess, DEFAULT_POSITION, type Color, type Move, type Square } from 'chess.js'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeftRight, ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Cpu, Flag, Pause, Play, RotateCcw, ScanLine, Target } from 'lucide-react'
 import { Board } from './Board'
 import { Chart } from './Charts'
+import { coachingPrinciple } from './coach'
+import { annotatedPgn, readClocks } from './pgn'
 import { budgets } from './engine'
-import { gameMoves, isComplete, playerColor, timeLabel, type Game, type Mode } from './library'
-import { categories, errors, estimatedRating, evalLabel, expectation, phases, summarize, variation, winProbability, type Category, type Phase } from './review'
+import { analysisKey, gameMoves, isComplete, playerColor, timeLabel, type EngineOptions, type Game, type Mode } from './library'
+import { categories, errors, estimatedRating, evalLabel, expectation, phases, material, recheckMove, summarize, variation, type Review, type Category, type Phase } from './review'
 
 export const percent = (value?: number) => value === undefined ? '—' : value.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%'
 export const number = (value?: number) => value === undefined ? '—' : value.toLocaleString('ru-RU', { maximumFractionDigits: 1 })
@@ -18,10 +20,13 @@ export function Empty({ title, message, children }: { title: string; message?: s
 }
 
 type Props = {
-  game?: Game; initialPly?: number; games: Game[]; nickname: string; mode: Mode; active?: string;
+  game?: Game; initialPly?: number; games: Game[]; nickname: string; mode: Mode; active?: string; eta?: number; options?: EngineOptions;
   onQueue: (game: Game, mode: Mode) => void; onPause: (game: Game) => void; onImport: () => void;
 }
-export function ReviewScreen({ game, initialPly = 0, games, nickname, mode, active, onQueue, onPause, onImport }: Props) {
+export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode, active, eta, options, onQueue, onPause, onImport }: Props) {
+  const [snapshot, setSnapshot] = useState('')
+  const saved = base?.savedAnalyses?.find(item => analysisKey(item) === snapshot)
+  const game = saved && base ? { ...base, ...saved } : base
   const moves = useMemo(() => game ? gameMoves(game) : [], [game?.pgn])
   const [index, setIndex] = useState(() => Math.min(moves.length, initialPly))
   const [orientation, orient] = useState<Color>(game ? playerColor(game, nickname) ?? 'w' : 'w')
@@ -29,9 +34,18 @@ export function ReviewScreen({ game, initialPly = 0, games, nickname, mode, acti
   const [playing, autoplay] = useState(false)
   const [guided, guide] = useState(false)
   const [speed, setSpeed] = useState<Mode>(game?.mode ?? mode)
+  const [compact, setCompact] = useState(false)
+  const [graph, setGraph] = useState<'points' | 'cp'>('points')
+  const [checked, setChecked] = useState<Record<number, Review>>({})
+  const [checking, setChecking] = useState<number>()
+  const [checkError, setCheckError] = useState('')
+  const controller = useRef<AbortController>(undefined)
+  useEffect(() => () => controller.current?.abort(), [])
+  const clocks = useMemo(() => game && /%clk|%emt/.test(game.pgn) ? readClocks(game.pgn, moves, game.time) : [], [game?.pgn, moves, game?.time])
   const reviews = game?.reviews ?? []
   const last = moves[index - 1]
-  const review = reviews[index - 1]
+  const verified = !saved ? checked[index - 1] : undefined
+  const review = verified ?? reviews[index - 1]
   const position = branches.at(-1)?.after ?? last?.after ?? game?.initial ?? DEFAULT_POSITION
   const completed = game && isComplete(game)
   const nextPosition = reviews[index]
@@ -64,8 +78,37 @@ export function ReviewScreen({ game, initialPly = 0, games, nickname, mode, acti
   const nextGuided = landmarks.find(item => item.index + 1 > index)
   const white = summarize(reviews, 'w'), black = summarize(reviews, 'b')
   const main = nextPosition?.before.pv[0] ?? (review?.after.pv[0])
-  const winBefore = review && winProbability(review.before, review.color)
-  const winAfter = review && winProbability(review.played, review.color)
+  const clock = clocks[index - 1]
+  const materialBalance = material(new Chess(position), 'w')
+  const pressureErrors = rankedErrors.filter(item => {
+    const remaining = clocks[item.index]?.remaining
+    return remaining !== undefined && remaining <= 30
+  })
+  const sameProfile = !!base && analysisKey(base) === analysisKey({ methodology: 2, mode: speed, options })
+  async function verify() {
+    if (!game || !review) return
+    const current = new AbortController()
+    controller.current = current
+    const moveIndex = index - 1
+    setChecking(moveIndex)
+    setCheckError('')
+    try {
+      const execute = () => recheckMove({ ...game, options }, moveIndex, current.signal)
+      const updated = navigator.locks ? await navigator.locks.request('chessmind-queue', { signal: current.signal }, execute) : await execute()
+      if (!current.signal.aborted) setChecked(previous => ({ ...previous, [moveIndex]: updated }))
+    } catch (error) {
+      if (!current.signal.aborted) setCheckError(error instanceof Error ? error.message : 'Не удалось перепроверить ход.')
+    } finally { setChecking(undefined) }
+  }
+  function download() {
+    if (!game) return
+    const url = URL.createObjectURL(new Blob([annotatedPgn(game)], { type: 'application/x-chess-pgn;charset=utf-8' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'chessmind-' + game.id.slice(0, 8) + '.pgn'
+    link.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
   function branch(fen: string, pv: string[]) {
     autoplay(false)
     const steps = variation(fen, pv)
@@ -90,14 +133,21 @@ export function ReviewScreen({ game, initialPly = 0, games, nickname, mode, acti
         <h2>{game.white} <span>{game.whiteElo}</span> <small>–</small> {game.black} <span>{game.blackElo}</span></h2>
         <p>{game.result} {game.opening ? ' · ' + game.opening[0] + ' ' + game.opening[1] : ''}</p></div>
       <div className="run-controls">
-        <select aria-label="Глубина анализа" value={speed} onChange={event => setSpeed(event.target.value as Mode)} disabled={game.queued}>
+        {base?.savedAnalyses?.length ? <select aria-label="Сохранённый анализ" value={saved ? snapshot : ''} onChange={event => setSnapshot(event.target.value)}>
+          <option value="">Текущий анализ</option>
+          {base.savedAnalyses.map(item => <option key={analysisKey(item)} value={analysisKey(item)}>
+            {item.methodology ?? 1}.0 · {budgets[item.mode].label} · {item.reviews.length} ходов · {item.options?.full ? 'Full' : 'Lite'} · {item.options?.multiplier ?? 1}×
+          </option>)}
+        </select> : null}
+        <select aria-label="Глубина анализа" value={speed} onChange={event => setSpeed(event.target.value as Mode)} disabled={game.queued || !!saved || checking !== undefined}>
           {Object.entries(budgets).map(([key, settings]) => <option key={key} value={key}>{settings.label}</option>)}
         </select>
         {game.queued ? <button onClick={() => onPause(game)}><Pause size={16} /> Пауза</button> :
-          <button className="primary" disabled={!!completed && game.mode === speed} onClick={() => onQueue(game, speed)}><Cpu size={17} />{completed && game.mode === speed ? 'Анализ готов' : reviews.length && game.mode === speed ? 'Продолжить' : 'Начать анализ'}</button>}
+          <button className="primary" disabled={!!saved || checking !== undefined || !!completed && sameProfile} onClick={() => onQueue(game, speed)}><Cpu size={17} />{completed && sameProfile ? 'Анализ готов' : reviews.length && sameProfile ? 'Продолжить' : 'Начать анализ'}</button>}
+        {reviews.length > 0 && <button onClick={download}>PGN с разбором</button>}
       </div>
       {(game.queued || reviews.length > 0 && !completed) && <label className="progress-label">
-        <span>{active === game.id ? 'Анализ Stockfish' : game.queued ? 'В очереди' : 'Приостановлено'}</span><progress max={moves.length} value={reviews.length} /><span>{reviews.length}/{moves.length}</span>
+        <span>{active === game.id ? 'Анализ Stockfish' : game.queued ? 'В очереди' : 'Приостановлено'}</span><progress max={moves.length} value={reviews.length} /><span>{reviews.length}/{moves.length}{active === game.id && !!eta && ' · ≈ ' + (eta >= 60 ? Math.ceil(eta / 60) + ' мин' : eta + ' с')}</span>
       </label>}
     </section>
     <div className="review-layout">
@@ -107,17 +157,27 @@ export function ReviewScreen({ game, initialPly = 0, games, nickname, mode, acti
           <div className="eval-bar" aria-label="Преимущество"><div style={{ height: expectation(review?.after ?? reviews[0]?.before ?? { kind: 'cp', value: 0, depth: 0, pv: [] }, orientation) + '%' }} /><span>{evalLabel(review?.after ?? reviews[0]?.before)}</span></div>
           <Board fen={position} orientation={orientation} last={branches.at(-1) ?? last}
             accent={review && errors.includes(review.category) && !branches.length ? categories[review.category][2] : undefined}
-            arrows={main && !branches.length ? [main] : []} onMove={tryMove} />
+            arrows={main && !branches.length ? [main] : []} onMove={tryMove} onSwipe={direction => navigate(index + direction)} />
         </div>
         <div className="player-line"><span className={'player-stone ' + (orientation === 'w' ? 'white' : 'black')} />{orientation === 'w' ? game.white : game.black}</div>
         <div className="board-controls">{controls}</div>
+        <div className="board-context"><strong>{last ? last.before.split(' ')[5] + (last.color === 'w' ? '. ' : '… ') + last.san : 'Начальная позиция'}</strong>
+          <span>Материал Б/Ч {materialBalance > 0 ? '+' : ''}{materialBalance}</span>
+          {clock?.spent !== undefined && <span>{number(clock.spent)} с на ход</span>}
+          {clock?.remaining !== undefined && <span>{number(clock.remaining)} с на часах</span>}
+        </div>
         {branches.length > 0 && <div className="branch"><strong>Вариант</strong> {branches.map(move => move.san).join(' ')}
           <div><button onClick={() => setBranches(branches.slice(0, -1))}><ChevronLeft size={16} /> Ход назад</button>
             <button onClick={() => setBranches([])}><RotateCcw size={16} /> К партии</button></div></div>}
-        {reviews.length > 0 && <section className="panel graph-panel"><h3>Преимущество</h3>
-          <Chart center={50} values={[expectation(reviews[0].before), ...reviews.map(move => expectation(move.after))]}
+        {reviews.length > 0 && <section className="panel graph-panel"><div className="list-heading"><h3>График партии</h3>
+          <select aria-label="Величина на графике" value={graph} onChange={event => setGraph(event.target.value as 'points' | 'cp')}>
+            <option value="points">Ожидаемые очки</option><option value="cp">Оценка в пешках</option>
+          </select></div>
+          <Chart center={graph === 'points' ? 50 : undefined} values={[reviews[0].before, ...reviews.map(move => move.after)].map(line =>
+            graph === 'points' ? expectation(line) : line.kind === 'mate' ? Math.sign(line.value) * 12 : Math.max(-12, Math.min(12, line.value / 100)))}
             labels={['Старт', ...reviews.map(item => moves[item.index].san + ' · ' + evalLabel(item.after))]} selected={index}
-            onSelect={navigate} caption="Ожидаемый результат белых" /></section>}
+            onSelect={navigate} caption={graph === 'points' ? 'Ожидаемый результат белых' : 'Оценка белых · шкала ±12, мат на границе'} /></section>}
+
       </section>
       <div className="review-details">
         <section className="panel coach-card">
@@ -126,29 +186,47 @@ export function ReviewScreen({ game, initialPly = 0, games, nickname, mode, acti
             <div className="move-heading"><Marker category={review.category} /><strong>{last?.san} · {categories[review.category][0]}</strong>
               <span>{review.depth > 0 ? 'Глубина ' + review.depth : 'Терминальная позиция'}</span></div>
             <p>{review.explanation}</p>
-            <div className="metric-strip"><div><small>До / после</small><b>{evalLabel(review.before)} / {evalLabel(review.after)}</b></div>
+            {coachingPrinciple(review.motif) && <p className="muted">{coachingPrinciple(review.motif)}</p>}
+            {review.draw && <p className="notice">{review.draw}</p>}
+            {review.reliable === false && <p className="notice">Категория предварительная. Сравнение на глубине {review.depth}; оценка могла меняться между итерациями.</p>}
+            {verified && <p className="muted">Перепроверка Professional · {verified.before.engine ?? 'Stockfish'}. Сводная статистика использует исходный разбор.</p>}
+            {review.reasons && <details><summary>Основания категории · сложность {review.complexity?.toLowerCase()}</summary>
+              <ul>{review.reasons.map(reason => <li key={reason}>{reason}</li>)}</ul>
+            </details>}
+            {review.played.wdl && <div className="wdl" aria-label="WDL после выбора хода">
+              {[['Победа', review.color === 'w' ? 0 : 2], ['Ничья', 1], ['Поражение', review.color === 'w' ? 2 : 0]].map(([label, i]) =>
+                <div key={label}><span>{label}</span><strong>{percent(review.played.wdl![Number(i)] / 10)}</strong></div>)}
+            </div>}
+            <div className="metric-strip"><div><small>Лучший / сыгранный</small><b>{evalLabel(review.before)} / {evalLabel(review.played)}</b></div>
               <div><small>Потеря ожидания</small><b>{number(review.loss)} п. п.</b></div>
-              <div><small>Вероятность победы</small><b>{winBefore === undefined || winAfter === undefined ? '—' : percent(winBefore) + ' → ' + percent(winAfter)}</b></div></div>
+              <div><small>Ожидание игрока</small><b>{percent(expectation(review.before, review.color, !!review.before.wdl && !!review.played.wdl))} → {percent(expectation(review.played, review.color, !!review.before.wdl && !!review.played.wdl))}</b></div></div>
+            <div className="action-row">{checking !== undefined ? <button onClick={() => controller.current?.abort()}>Остановить перепроверку</button> :
+              <button disabled={!!active || !!saved} onClick={() => void verify()}>Перепроверить ход</button>}</div>
+            {checkError && <p role="alert">{checkError}</p>}
+            {checking !== undefined && <p role="status">Stockfish перепроверяет ход…</p>}
           </> : <p className="muted">{index ? 'Этот ход ещё не проанализирован.' : 'Выберите ход партии для просмотра объяснения.'}</p>}
           {reviews.length > 0 && <div className="action-row"><button disabled={!nextError} onClick={() => nextError && navigate(nextError.index + 1)}><Flag size={16} /> К ошибке</button>
             <button disabled={!nextGuided && guided} onClick={() => { guide(true); const next = guided ? nextGuided : landmarks[0] ?? reviews[0]; if (next) navigate(next.index + 1) }}>
               {guided ? 'Следующий момент' : 'Пошаговый разбор'}</button></div>}
-          {review && <div className="variations"><h4>Варианты до хода</h4>{review.lines.filter(line => line.pv.length > 0).map((line, idx) => {
+          {review && <div className="variations"><h4>Сравнение вариантов</h4>{(review.lines.some(line => line.pv[0] === review.played.pv[0]) ? review.lines : [...review.lines, review.played]).filter(line => line.pv.length > 0).map((line, idx) => {
             const steps = variation(last!.before, line.pv)
-            return <div className="pv" key={line.pv[0]}><button onClick={() => branch(last!.before, line.pv)}><strong>{evalLabel(line)}</strong><span>{steps.slice(0, 8).map(step => step.san).join(' ')}</span>{idx === 0 && <small>Лучший</small>}</button>
+            return <div className="pv" key={line.pv[0]}><button onClick={() => branch(last!.before, line.pv)}><strong>{evalLabel(line)}</strong><span>{steps.slice(0, 8).map(step => step.san).join(' ')}</span>{(idx === 0 || line.pv[0] === review.played.pv[0]) && <small>{idx === 0 ? 'Лучший' : 'Сыгранный'}{idx === 0 && line.pv[0] === review.played.pv[0] ? ' · сыгранный' : ''}</small>}</button>
               {branches[0]?.before === last!.before && branches[0]?.lan === steps[0]?.lan && <div className="pv-steps">{steps.map((step, i) => <button key={i} onClick={() => setBranches(steps.slice(0, i + 1))}>{step.san}</button>)}</div>}</div>
           })}</div>}
         </section>
-        <section className="panel move-panel"><h3>Ходы партии <span>{moves.length}</span></h3>
-          <div className="move-grid">{moves.map((move, i) => <button key={i} aria-pressed={index === i + 1} onClick={() => navigate(i + 1)}>
+        <section className="panel move-panel"><div className="list-heading"><h3>Ходы партии <span>{moves.length}</span></h3>
+          <button aria-pressed={compact} onClick={() => setCompact(!compact)}>{compact ? 'Только важные' : 'Все ходы'}</button></div>
+          <div className="move-grid">{moves.map((move, i) => (!compact || landmarks.some(item => item.index === i)) && <button key={i} aria-pressed={index === i + 1} onClick={() => navigate(i + 1)}>
             <span>{move.before.split(' ')[5]}{move.color === 'w' ? '.' : '…'}</span>{move.san}{reviews[i] && <Marker category={reviews[i].category} />}</button>)}</div></section>
       </div>
     </div>
     {completed && <div className="review-summary">
-      <section className="panel"><h3>Итоги партии</h3>
+      <section className="panel"><h3>Итоги партии <small>· Методология {game.methodology ?? 1}.0</small></h3>
         <table><thead><tr><th>Показатель</th><th>Белые</th><th>Чёрные</th></tr></thead><tbody>
           <tr><td>Точность</td><td>{percent(white.accuracy)}</td><td>{percent(black.accuracy)}</td></tr>
           <tr><td>ACPL</td><td>{number(white.acpl)} ({white.cpSample})</td><td>{number(black.acpl)} ({black.cpSample})</td></tr>
+          <tr><td>Средняя потеря ожидания</td><td>{number(white.esl)} п. п.</td><td>{number(black.esl)} п. п.</td></tr>
+          <tr><td>Разброс точности</td><td>{number(white.deviation)}</td><td>{number(black.deviation)}</td></tr>
           <tr><td>Оценка рейтинга</td>{(['w','b'] as const).map(color => {
             const estimate = estimatedRating(game, color, games)
             return <td key={color}>{estimate ? estimate.value + ' (' + estimate.low + '–' + estimate.high + ')' : 'Мало данных'}</td>
@@ -156,6 +234,7 @@ export function ReviewScreen({ game, initialPly = 0, games, nickname, mode, acti
           {(Object.keys(phases) as Phase[]).map(phase => <tr key={phase}><td>{phases[phase]}</td>
             {(['w','b'] as const).map(color => <td key={color}>{percent(summarize(reviews, color, phase).accuracy)}</td>)}</tr>)}
         </tbody></table>
+        {clocks.some(item => item.remaining !== undefined) && <p>Ошибки при ≤30 с после хода: {pressureErrors.length}. {pressureErrors[0] && <button onClick={() => navigate(pressureErrors[0].index + 1)}>К первой</button>}</p>}
         <h4>Ключевые моменты</h4>
         {rankedErrors.length === 0 && <p className="muted">Движок не выявил ходов, превышающих пороги ошибок.</p>}
         {[...rankedErrors.slice(0, 3), ...bestMoves.slice(0, 3)].map(item => <button className="landmark" key={item.index} onClick={() => { navigate(item.index + 1); window.scrollTo({ top: 0, behavior: 'smooth' }) }}><Marker category={item.category} /> {moves[item.index].san}<span>{item.motif ?? categories[item.category][0]}</span></button>)}

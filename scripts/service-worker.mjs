@@ -9,9 +9,10 @@ for (const file of files) hash.update(file).update(await readFile('dist' + file)
 const version = 'chessmind-' + hash.digest('hex').slice(0, 16)
 await writeFile('dist/sw.js', `
 const version = ${JSON.stringify(version)}
+const optional = new Set(['/engine/stockfish-19-single.js', '/engine/stockfish-19-single.wasm'])
 const files = new Set(${JSON.stringify(files)})
 self.addEventListener('install', event => {
-  event.waitUntil(caches.open(version).then(cache => cache.addAll([...files])))
+  event.waitUntil(caches.open(version).then(cache => cache.addAll([...files].filter(path => !optional.has(path)))))
 })
 self.addEventListener('message', event => {
   if (event.data === 'activate-update') self.skipWaiting()
@@ -23,6 +24,12 @@ self.addEventListener('fetch', event => {
   const url = new URL(event.request.url)
   if (url.origin !== self.location.origin || event.request.method !== 'GET') return
   const path = event.request.mode === 'navigate' ? '/index.html' : url.pathname
-  if (files.has(path)) event.respondWith(caches.open(version).then(cache => cache.match(path)).then(response => response || fetch(event.request)))
+  if (files.has(path)) event.respondWith(caches.open(version).then(async cache => {
+    const hit = await cache.match(path)
+    if (hit) return hit
+    const response = await fetch(event.request)
+    if (optional.has(path) && response.ok) event.waitUntil(cache.put(path, response.clone()).catch(() => {}))
+    return response
+  }))
 })
 `)

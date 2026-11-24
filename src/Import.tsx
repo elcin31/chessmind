@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { ArrowDownToLine, ArrowRight, ClipboardPaste, FileUp, Globe2, RefreshCw } from 'lucide-react'
 import { db, importAccount, importPgn, type Game, type Source } from './library'
 
@@ -9,21 +9,26 @@ export function ImportForm({ nickname, onNickname, onSaved }: { nickname: string
   const [active, setActive] = useState(false)
   const [message, setMessage] = useState('')
   const [failed, setFailed] = useState(false)
+  const controller = useRef<AbortController>(undefined)
+  const last = useRef<{ older: boolean; file?: File }>(undefined)
   async function run(older = false, file?: File) {
     if (active) return
+    const current = new AbortController()
+    controller.current = current
+    last.current = { older, file }
     setActive(true)
     setFailed(false)
     setMessage('Обрабатываем партии…')
     try {
       const account = name.trim()
-      const result = source === 'pgn' || file ? await importPgn(file ? await file.text() : pgn) :
-        await importAccount(source, account, setMessage, older)
+      const result = source === 'pgn' || file ? await importPgn(file ?? pgn, 'pgn', undefined, current.signal, setMessage) :
+        await importAccount(source, account, setMessage, older, current.signal)
       if (!file && source !== 'pgn') onNickname(account)
       setMessage('Добавлено: ' + result.added + ' · Уже сохранено: ' + result.skipped + (result.invalid ? ' · Пропущено: ' + result.invalid : '') + ('warning' in result && result.warning ? ' · ' + result.warning : ''))
       if (result.added) setPgn('')
     } catch (error) {
-      setFailed(true)
-      setMessage(error instanceof Error ? error.message : 'Не удалось импортировать партии.')
+      setFailed(!current.signal.aborted)
+      setMessage(current.signal.aborted ? 'Импорт остановлен. Уже добавленные партии сохранены.' : error instanceof Error ? error.message : 'Не удалось импортировать партии.')
     } finally {
       try { onSaved(await (await db).getAll('games')) } catch { setFailed(true); setMessage('Локальная база недоступна.') }
       setActive(false)
@@ -53,6 +58,8 @@ export function ImportForm({ nickname, onNickname, onSaved }: { nickname: string
         {nickname && <button className="quiet" type="button" onClick={() => void run(true)} disabled={active || !name.trim()}><RefreshCw size={15} /> Загрузить более ранние партии</button>}
       </>}
     </form>
+    {active && <button type="button" onClick={() => controller.current?.abort()}>Остановить импорт</button>}
+    {failed && !active && last.current && <button onClick={() => void run(last.current!.older, last.current!.file)}>Повторить</button>}
     {message && <p role="status" className={'notice ' + (failed ? 'bad' : '')}>{message}</p>}
     {source !== 'pgn' && !message && <div className="import-note"><Globe2 size={15} /> Общедоступные архивы · Регистрация не нужна</div>}
   </div>

@@ -4,3 +4,8 @@ public/engine/
 public/eco.json
 .vercel/
 public/legal/dependencies.txt
+
+public/opening-tree.json
+
+/test-results/
+/playwright-report/

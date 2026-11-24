@@ -5,6 +5,24 @@ const pieces = { p: 'пешка', n: 'конь', b: 'слон', r: 'ладья',
 const enemy = (color: Color): Color => color === 'w' ? 'b' : 'w'
 const result = (motif: string, explanation: string) => ({ motif, explanation })
 
+const principles: Record<string, string> = {
+  'Вилка': 'Перед ответом на угрозу проверьте, защищает ли ход вторую цель.',
+  'Двойной удар': 'Ищите ходы, создающие две независимые угрозы.',
+  'Связка': 'Проверьте линию между фигурой и королём прежде, чем считать фигуру защитником.',
+  'Вскрытая атака': 'При отходе фигуры проверьте линии, которые она освобождает.',
+  'Сквозной удар': 'Следите за фигурами, стоящими на одной линии с королём.',
+  'Уничтожение защиты': 'Проверьте, сохранится ли защита после размена единственного защитника.',
+  'Незащищённая фигура': 'Перед ходом проверьте возможные взятия и защиту фигур.',
+  'Матовая угроза': 'Рассчитайте шахи соперника до конца форсированной линии.',
+  'Безопасность короля': 'Перед вскрытием линий к королю посчитайте доступные шахи.',
+  'Проходная пешка': 'При оценке проходной проверьте маршрут к превращению и возможности блокады.',
+  'Пешечная структура': 'Перед взятием сравните итоговое расположение пешек в обоих вариантах.',
+  'Пешечный островок': 'У пешек на соседних вертикалях больше возможностей взаимной поддержки.',
+  'Открытая вертикаль': 'Проверьте поля вторжения по открытой линии.',
+  'Развитие': 'В дебюте сопоставляйте темпы развития с конкретными угрозами.',
+}
+export const coachingPrinciple = (motif?: string) => motif ? principles[motif] : undefined
+
 function tactical(step: Move, reply: Move[]) {
   const before = new Chess(step.before)
   const after = new Chess(step.after)
@@ -20,6 +38,22 @@ function tactical(step: Move, reply: Move[]) {
   const uncovered = reply.find(move => move.color === step.color && move.captured && move.from !== step.to &&
     !!after.get(move.to) && after.attackers(move.to, step.color).includes(move.from) && !before.attackers(move.to, step.color).includes(move.from))
   if (uncovered) return result('Вскрытая атака', step.san + ' открывает линию атаки. В варианте движка это позволяет сыграть ' + uncovered.san + '.')
+  const response = reply[0], follow = reply[1]
+  if (after.isCheck() && response?.piece === 'k' && follow?.captured && follow.from === step.to) {
+    const ray = (square: Square) => [Math.sign(square.charCodeAt(0) - step.to.charCodeAt(0)), Math.sign(Number(square[1]) - Number(step.to[1]))].join(',')
+    const king = after.board().flat().find(piece => piece?.type === 'k' && piece.color === opponent)
+    if (king && ray(king.square) === ray(follow.to) &&
+      Math.max(Math.abs(follow.to.charCodeAt(0) - step.to.charCodeAt(0)), Math.abs(Number(follow.to[1]) - Number(step.to[1]))) >
+      Math.max(Math.abs(king.square.charCodeAt(0) - step.to.charCodeAt(0)), Math.abs(Number(king.square[1]) - Number(step.to[1]))) &&
+      ['q', 'r', 'b'].includes(step.piece) && before.get(follow.to)?.color === opponent) {
+      return result('Сквозной удар', 'После шаха ' + step.san + ' в линии ' + response.san + ' ' + follow.san + ' падает фигура за королём.')
+    }
+  }
+  if (step.captured && follow?.captured && before.get(follow.to)?.color === opponent &&
+    before.attackers(follow.to, opponent).length === 1 && before.attackers(follow.to, opponent)[0] === step.to &&
+    !after.attackers(follow.to, opponent).length) {
+    return result('Уничтожение защиты', step.san + ' снимает единственную защиту поля ' + follow.to + '. В ответной линии возможно ' + follow.san + '.')
+  }
   const king = after.board().flat().find(piece => piece?.type === 'k' && piece.color === opponent)
   if (king && !after.isCheck()) {
     const [file, rank] = [king.square.charCodeAt(0) - 97, Number(king.square[1]) - 1]
@@ -47,7 +81,7 @@ function pawnStructure(chess: Chess, color: Color) {
   const pawns = chess.board().flat().filter(piece => piece?.type === 'p' && piece.color === color)
   const columns = Array.from({ length: 8 }, (_, file) => pawns.filter(piece => piece!.square.charCodeAt(0) - 97 === file).length)
   const isolated = columns.reduce((sum, count, file) => sum + (count && !columns[file - 1] && !columns[file + 1] ? count : 0), 0)
-  return { doubled: columns.reduce((sum, count) => sum + Math.max(0, count - 1), 0), isolated }
+  return { islands: columns.filter((count, file) => count && !columns[file - 1]).length, doubled: columns.reduce((sum, count) => sum + Math.max(0, count - 1), 0), isolated }
 }
 function passed(chess: Chess, color: Color, square: Square) {
   return !chess.board().flat().some(piece => piece?.type === 'p' && piece.color !== color &&
@@ -63,7 +97,7 @@ const center = ['d4', 'd5', 'e4', 'e5'] as Square[]
 
 export function explain(
   move: Move, best: Line, played: Line, after: Line,
-  facts: { forced: boolean; unique: boolean; lostMate: boolean; allowsMate: boolean; category: string; loss: number },
+  facts: { forced: boolean; unique: boolean; lostMate: boolean; allowsMate: boolean; category: string; loss: number; sacrificeType?: string },
   phase: Phase,
 ): { explanation: string; motif?: string } {
   const afterBoard = new Chess(move.after)
@@ -77,7 +111,7 @@ export function explain(
   if (facts.forced) return { explanation: 'В этой позиции был только один легальный ход.' }
   if (facts.lostMate && facts.loss > 0) return result('Упущенный мат', 'Движок находит мат в ' + Math.abs(best.value) + ' после ' + variationSan + '. Сыгранный ход не сохраняет найденный форсированный мат.')
   if (facts.allowsMate) return result('Матовая угроза', 'Сыгранный ход допускает форсированный мат по оценке Stockfish. Ответ: ' + (reply[0]?.san ?? 'см. вариант') + '.')
-  if (facts.category === 'brilliant' && sacrifice(move, after)) return result('Тактическая жертва', 'В линии ' + reply.slice(0, 5).map(step => step.san).join(' ') + ' соперник выигрывает материал, но углублённый анализ подтверждает достаточную компенсацию.')
+  if (facts.category === 'brilliant' && sacrifice(move, after)) return result(facts.sacrificeType ?? 'Жертва', 'В линии ' + reply.slice(0, 5).map(step => step.san).join(' ') + ' соперник выигрывает материал, но углублённый анализ подтверждает достаточную компенсацию.')
   if (facts.unique && facts.category === 'great') return result('Единственный сильный ход', 'Stockfish подтверждает ' + move.san + '. Следующий по силе вариант заметно хуже для стороны, сделавшей ход.')
   const swing = reply.length > 0 ? material(new Chess(reply.at(-1)!.after), mover) - material(beforeBoard, mover) : 0
   if (facts.loss >= 6 && reply[0]?.captured && swing <= -1) {
@@ -102,6 +136,9 @@ export function explain(
     if (newPawns.doubled > oldPawns.doubled || newPawns.isolated > oldPawns.isolated) {
       return result('Пешечная структура', move.san + ' увеличивает число ' + (newPawns.doubled > oldPawns.doubled ? 'сдвоенных' : 'изолированных') + ' пешек. Stockfish предпочитает ' + preferred + '.')
     }
+    if (move.piece === 'p' && newPawns.islands > oldPawns.islands && preferred) {
+      return result('Пешечный островок', 'Число групп пешек выросло с ' + oldPawns.islands + ' до ' + newPawns.islands + '. Stockfish предпочитает ' + preferred + '.')
+    }
     if (kingZone(afterBoard, mover) >= kingZone(beforeBoard, mover) + 2 && reply.some(step => step.color !== mover && /[+#]$/.test(step.san))) {
       return result('Безопасность короля', 'После ' + move.san + ' соперник контролирует больше полей рядом с королём. В ответном варианте появляется шах.')
     }
@@ -117,6 +154,9 @@ export function explain(
     if (move.piece === 'p' && !passed(beforeBoard, mover, move.from) && afterBoard.get(move.to)?.type === 'p' && passed(afterBoard, mover, move.to)) {
       return result('Проходная пешка', 'После ' + move.san + ' у соперника нет пешек, которые могли бы перекрыть продвижение пешки ' + move.to + ' со своего или соседних вертикалей.')
     }
+    const openFile = move.piece === 'r' && move.from[0] !== move.to[0] && !afterBoard.board().flat().some(piece =>
+      piece?.type === 'p' && piece.square[0] === move.to[0])
+    if (openFile) return result('Открытая вертикаль', move.san + ' переводит ладью на вертикаль ' + move.to[0] + ', свободную от пешек.')
     if (/[+]$/.test(move.san)) return result('Шах', move.san + ' вынуждает соперника защититься от шаха.' + (reply.length ? ' Вариант Stockfish: ' + reply.slice(0, 4).map(step => step.san).join(' ') + '.' : ''))
     const control = (chess: Chess) => center.filter(square => chess.attackers(square, mover).length).length
     if (phase === 'opening' && control(afterBoard) >= control(beforeBoard) + 2) return result('Контроль центра', move.san + ' увеличивает число центральных полей под контролем этой стороны.')
