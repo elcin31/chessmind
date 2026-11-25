@@ -1,5 +1,5 @@
 import { Chess, type Color, type Move, type Square } from 'chess.js'
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useId, useMemo, useRef, useState } from 'react'
 
 type Props = {
   fen: string; orientation?: Color; last?: Move; accent?: string; arrows?: string[];
@@ -7,7 +7,7 @@ type Props = {
   onMove?: (from: Square, to: Square, promotion?: string) => void
 }
 
-export function Board({ fen, orientation = 'w', last, accent, arrows = [], onSwipe, onMove }: Props) {
+export const Board = memo(function Board({ fen, orientation = 'w', last, accent, arrows = [], onSwipe, onMove }: Props) {
   const chess = useMemo(() => new Chess(fen), [fen])
   const [selection, select] = useState<{ fen: string; square: Square }>()
   const [promotion, promote] = useState<{ fen: string; from: Square; to: Square }>()
@@ -117,4 +117,4 @@ export function Board({ fen, orientation = 'w', last, accent, arrows = [], onSwi
       <button onClick={() => promote(undefined)}>Отмена</button>
     </div>}
   </div>
-}
+})

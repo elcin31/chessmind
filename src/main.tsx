@@ -1,13 +1,15 @@
 import { createRoot } from 'react-dom/client'
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_POSITION } from 'chess.js'
 import { Activity, ArrowDownToLine, ArrowRight, BookOpen, ChartNoAxesCombined, CircleHelp, Cpu, FolderOpen, House, List, MonitorDown, Settings2, ShieldCheck, Target, Upload, Zap } from 'lucide-react'
+import { updateLiveReview, updateProgress } from './AnalysisProgress'
+import { GameCard } from './PlayerCard'
 import { Board } from './Board'
 import { ImportForm } from './Import'
-import { Empty, percent, ReviewScreen } from './ReviewScreen'
-import { budgets, trimCache } from './engine'
-import { analysisKey, db, methodologyVersion, displayDate, isComplete, parsePgn, playerColor, timeLabel, type Analysis, type EngineOptions, type Game, type Mode, type Practice } from './library'
-import { analyzeGame, categories, summarize, type Line, type Review } from './review'
+import { Empty, ReviewScreen } from './ReviewScreen'
+import { budgets, trimCache, type SearchSpeed } from './engine'
+import { analysisKey, db, methodologyVersion, historicalRating, isComplete, parsePgn, playerColor, timeLabel, type Analysis, type EngineOptions, type Game, type Mode, type Practice } from './library'
+import { analyzeGame, categories, type Line, type Review } from './review'
 import './style.css'
 
 const Methodology = lazy(() => import('./Methodology').then(module => ({ default: module.Methodology })))
@@ -56,7 +58,6 @@ function App() {
   const [settings, setSettings] = useState(loadSettings)
   const [games, setGames] = useState<Game[]>([])
   const [practice, setPractice] = useState<Practice[]>([])
-  const [eta, setEta] = useState<number>()
   const [active, setActive] = useState<string>()
   const [status, setStatus] = useState('')
   const [offline, setOffline] = useState(false)
@@ -118,36 +119,70 @@ function App() {
     const controller = new AbortController()
     current.current = { id: pending.id, controller }
     setActive(pending.id)
-    setEta(undefined)
     const run = async () => {
       let latest = await (await db).get('games', pending.id)
       if (!latest?.queued || controller.signal.aborted) return mergeGame(latest)
       if (latest.methodology !== 2) latest = await patchGame(latest.id, prepareAnalysis(latest, latest.mode ?? 'standard', settings.engine))
       if (!latest) return
-      const started = performance.now()
       const existing = latest.reviews?.length ?? 0
       const { id, moves } = latest
+      let staged = latest.reviews ?? []
+      let persisted = existing
+      let lastSave = performance.now(), lastPaint = lastSave, lastPly = lastSave
+      let search: SearchSpeed | undefined
+      let secondsPerPly: number | undefined
+      const publishProgress = () => updateProgress({
+        id, done: staged.length, total: moves, search,
+        eta: staged.length - existing >= 2 && secondsPerPly !== undefined ? Math.ceil(secondsPerPly * (moves - staged.length)) : undefined,
+      })
+      async function checkpoint() {
+        if (staged.length === persisted) return
+        const reviews = [...staged]
+        const complete = reviews.length === moves
+        const updated = await patchGame(id, { reviews, ...(complete ? { queued: false } : {}) })
+        if (complete) mergeGame(updated)
+        persisted = reviews.length
+        lastSave = performance.now()
+      }
+      publishProgress()
       try {
         await analyzeGame(latest, latest.mode ?? 'standard', controller.signal, async reviews => {
-          const seconds = (performance.now() - started) / 1000
-          if (reviews.length - existing >= 3) setEta(Math.ceil(seconds * (moves - reviews.length) / (reviews.length - existing)))
-          mergeGame(await patchGame(id, { reviews, ...(reviews.length === moves ? { queued: false } : {}) }))
+          const now = performance.now()
+          const seconds = (now - lastPly) / 1000
+          secondsPerPly = secondsPerPly === undefined ? seconds : .82 * secondsPerPly + .18 * seconds
+          lastPly = now
+          staged = reviews
+          publishProgress()
+          if (reviews.length === existing + 1 || now - lastPaint >= 300) {
+            updateLiveReview({ id, reviews: [...reviews] })
+            lastPaint = now
+          }
+          if (reviews.length === moves || reviews.length === existing + 1 || now - lastSave >= 900) await checkpoint()
+        }, sample => {
+          search = sample
+          publishProgress()
         })
       } catch (error) {
         if (!controller.signal.aborted) {
           setStatus(error instanceof Error ? error.message : 'Ошибка анализа.')
-          mergeGame(await patchGame(latest.id, { queued: false }))
+          mergeGame(await patchGame(id, { queued: false }))
         }
+      } finally {
+        await checkpoint()
+        if (staged.length < moves) mergeGame(await (await db).get('games', id))
       }
+
     }
     const work = navigator.locks ? navigator.locks.request('chessmind-queue', { signal: controller.signal }, run) : run()
     void work.catch(error => { if (!controller.signal.aborted) setStatus(error instanceof Error ? error.message : 'Ошибка очереди.') }).finally(() => {
       current.current = undefined
+      updateLiveReview(undefined)
+      updateProgress(undefined)
       setActive(undefined)
     })
   }, [games, visible, active])
 
-  function open(game: Game, ply?: number) { window.location.hash = 'review/' + game.id + (ply ? '/' + ply : '') }
+  const open = useCallback((game: Game, ply?: number) => { window.location.hash = 'review/' + game.id + (ply ? '/' + ply : '') }, [])
   function go(page: Page) { window.location.hash = page }
   async function queueBatch(items: Game[], mode: Mode) {
     setStatus('')
@@ -170,8 +205,8 @@ function App() {
   function queue(game: Game, mode: Mode) { return queueBatch([game], mode) }
   async function pause(game: Game) {
     try {
-      mergeGame(await patchGame(game.id, { queued: false }))
       if (current.current?.id === game.id) current.current.controller.abort()
+      mergeGame(await patchGame(game.id, { queued: false }))
     } catch { setStatus('Не удалось приостановить анализ.') }
   }
   const finished = games.filter(isComplete).length
@@ -187,7 +222,7 @@ function App() {
       <a href="#home" className="brand"><img src="/icon.svg" width="43" height="43" alt="" /><div>Chess<span>Mind</span><small>АНАЛИЗ ПАРТИЙ</small></div></a>
       <nav aria-label="Основные разделы" className="main-nav">{navigation(core)}</nav>
       <nav aria-label="Дополнительные разделы" className="secondary-nav">{navigation(secondary)}</nav>
-      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0</small></div>
+      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0.1</small></div>
     </aside>
     <main>
       <header className="topbar">
@@ -215,7 +250,7 @@ function App() {
         }}>Обновить</button></div>}
         {location.page === 'home' && <>
           <section className="hero">
-            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0</div>
+            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0.1</div>
               <h1>Разбор шахматных<br className="desktop-break" /> партий</h1>
               <p>Найдите переломные ходы, проверьте варианты Stockfish и потренируйтесь на собственных ошибках.</p>
               <div className="hero-actions"><a className="primary" href="#games"><ArrowDownToLine size={18} /> Добавить партию</a>
@@ -231,7 +266,7 @@ function App() {
             <section className="panel home-library">
               <div className="card-head"><div className="section-icon"><FolderOpen size={21} /></div><div><h2>Моя библиотека</h2><p>Партии и анализы на этом устройстве</p></div></div>
               <div className="library-summary"><div><strong>{games.length}</strong><span>Сохранено партий</span></div><div><strong>{finished}</strong><span>Разобрано</span></div></div>
-              {sorted.length ? <div className="recent-list">{sorted.slice(0, 3).map(game => <button key={game.id} onClick={() => open(game)}><span><b>{game.white} – {game.black}</b><small>{displayDate(game.date)} · {timeLabel(game.time)}</small></span><ArrowRight size={17} /></button>)}</div> :
+              {sorted.length ? <div className="recent-list">{sorted.slice(0, 3).map(game => <GameCard key={game.id} game={game} nickname={settings.nickname} open={open} recent />)}</div> :
                 <div className="library-empty"><FolderOpen size={20} /><p>Здесь появятся ваши партии после импорта.</p></div>}
               {sorted.length > 0 && <a className="quiet" href="#games">Все партии <ArrowRight size={16} /></a>}
             </section>
@@ -239,7 +274,7 @@ function App() {
           <footer className="home-footer"><span><Cpu size={16} /> Все расчёты на вашем устройстве</span><span><Zap size={16} /> Бесплатно и без лимитов</span><span><MonitorDown size={16} /> Устанавливается как приложение</span></footer>
         </>}
         {location.page === 'games' && <>{importForm}<GameList games={sorted} nickname={settings.nickname} open={open} queue={items => void queueBatch(items, settings.mode)} /></>}
-        {location.page === 'review' && <ReviewScreen key={(selected?.id ?? '') + ':' + (location.ply ?? 0)} game={selected} initialPly={location.ply} games={games} nickname={settings.nickname} mode={settings.mode} active={active} eta={eta} options={settings.engine} onQueue={queue} onPause={pause} onImport={() => go('games')} />}
+        {location.page === 'review' && <ReviewScreen key={(selected?.id ?? '') + ':' + (location.ply ?? 0)} game={selected} initialPly={location.ply} games={games} nickname={settings.nickname} mode={settings.mode} active={active} options={settings.engine} onQueue={queue} onPause={pause} onImport={() => go('games')} />}
         <Suspense fallback={<p role="status">Загружаем раздел…</p>}>
         {location.page === 'training' && <Training games={games} nickname={settings.nickname} practice={practice} onPractice={item => setPractice(old => [...old.filter(entry => entry.id !== item.id), item])} onImport={() => go('games')} />}
         {location.page === 'stats' && <Statistics games={games} nickname={settings.nickname} open={open} />}
@@ -279,20 +314,7 @@ function GameList({ games, nickname, open, queue }: { games: Game[]; nickname: s
     </div>
     {shown.some(game => !isComplete(game) && !game.queued) && <button onClick={() => queue(shown.filter(game => !isComplete(game) && !game.queued))}>Добавить в очередь партии без полного анализа</button>}
     {!shown.length && <Empty title={games.length ? 'Партии не найдены' : 'Библиотека пуста'} message={games.length ? 'Измените параметры поиска.' : 'Выберите источник импорта выше.'} />}
-    <div className="game-rows">{shown.slice(0, limit).map(game => {
-      const side = playerColor(game, nickname)
-      const opponent = side === 'w' ? [game.black, game.blackElo] : side === 'b' ? [game.white, game.whiteElo] : []
-      const white = isComplete(game) ? summarize(game.reviews!, 'w') : undefined
-      const black = isComplete(game) ? summarize(game.reviews!, 'b') : undefined
-      return <button className="game-row" key={game.id} onClick={() => open(game)}>
-        <span className="game-players"><b>{game.white} {game.whiteElo && <small>{game.whiteElo}</small>} – {game.black} {game.blackElo && <small>{game.blackElo}</small>}</b>
-          <small>{side ? 'Ваш цвет: ' + (side === 'w' ? 'белые' : 'чёрные') + ' · Соперник: ' + opponent.filter(Boolean).join(' ') : game.source === 'pgn' ? 'PGN' : game.source === 'chesscom' ? 'Chess.com' : 'Lichess'}</small></span>
-        <span className="game-meta"><b>{game.result}</b><small>{displayDate(game.date)} · {timeLabel(game.time)}</small></span>
-        <span className="game-meta"><b>{game.opening ? game.opening.slice(0, 2).join(' ') : 'Дебют неизвестен'}</b><small>{game.moves} полуходов</small></span>
-        <span className="game-meta"><b>{game.queued ? 'В очереди' : isComplete(game) ? 'Разобрана' : game.reviews?.length ? 'Приостановлена' : 'Без анализа'}</b>
-          {white && black && <small>Точность Б / Ч · {percent(white.accuracy)} / {percent(black.accuracy)}</small>}</span><ArrowRight size={18} />
-      </button>
-    })}</div>
+    <div className="game-rows">{shown.slice(0, limit).map(game => <GameCard key={game.id} game={game} nickname={nickname} open={open} />)}</div>
     {shown.length > limit && <button className="quiet" onClick={() => setLimit(limit + 30)}>Показать ещё</button>}
   </section>
 }
@@ -324,7 +346,7 @@ function readEngineOptions(value?: EngineOptions): EngineOptions | undefined {
     full: value.full === true,
     multiplier: [0.5, 1, 2, 3].includes(value.multiplier ?? 0) ? value.multiplier : undefined,
     threads: value.threads === 1 ? 1 : undefined,
-    hash: value.hash === 32 || value.hash === 64 ? value.hash : undefined,
+    hash: value.hash === 16 || value.hash === 32 || value.hash === 64 ? value.hash : undefined,
     cache: [0, 500, 3000, 6000].includes(value.cache ?? -1) ? value.cache : undefined,
   }
 }
@@ -366,7 +388,7 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
           row.savedAnalyses.some(item => !Object.hasOwn(budgets, item.mode) || !validReviews(item.reviews)))) {
           throw new Error('Копия содержит некорректный анализ.')
         }
-        restored.push({ ...game, timestamp: Number.isFinite(row.timestamp) ? row.timestamp : game.timestamp,
+        restored.push({ ...game, whiteElo: game.whiteElo ?? historicalRating(row.whiteElo), blackElo: game.blackElo ?? historicalRating(row.blackElo), timestamp: Number.isFinite(row.timestamp) ? row.timestamp : game.timestamp,
           mode: row.mode && Object.hasOwn(budgets, row.mode) ? row.mode : undefined, reviews: row.reviews,
           methodology: row.methodology === 2 ? 2 : 1, options: readEngineOptions(row.options), savedAnalyses: row.savedAnalyses })
 
@@ -383,7 +405,7 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
           const imported = [...(game.savedAnalyses ?? []), ...(game.mode && game.reviews ? [{
             mode: game.mode, methodology: game.methodology, options: game.options, reviews: game.reviews,
           }] : [])]
-          let update = previous
+          let update = { ...previous, whiteElo: previous.whiteElo ?? game.whiteElo, blackElo: previous.blackElo ?? game.blackElo }
           for (const item of imported) {
             const key = analysisKey(item)
             if (key === existingKey) {
@@ -433,7 +455,7 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
       <label className="field">Цвет доски<select value={settings.board ?? 'sage'} onChange={event => onSettings({ ...settings, board: event.target.value as Settings['board'] })}><option value="sage">Шалфей</option><option value="navy">Тёмно-синий</option><option value="gold">Золотой</option></select></label>
       <label className="field">Бюджет Professional<select value={settings.engine?.multiplier ?? 1} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, multiplier: Number(event.target.value) } })}>{[0.5, 1, 2, 3].map(value => <option key={value} value={value}>{value}×</option>)}</select></label>
       <label className="field">Потоки Lite<select value={settings.engine?.threads ?? 'auto'} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, threads: event.target.value === '1' ? 1 : undefined } })}><option value="auto">Авто · до 2 потоков</option><option value="1">1 поток</option></select></label>
-      <label className="field">Память Stockfish Hash<select value={settings.engine?.hash ?? 16} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, hash: Number(event.target.value) as EngineOptions['hash'] } })}>{[16, 32, 64].map(value => <option key={value} value={value}>{value} МБ</option>)}</select></label>
+      <label className="field">Память Stockfish Hash<select value={settings.engine?.hash ?? 'auto'} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, hash: event.target.value === 'auto' ? undefined : Number(event.target.value) as EngineOptions['hash'] } })}><option value="auto">Авто</option>{[16, 32, 64].map(value => <option key={value} value={value}>{value} МБ</option>)}</select></label>
       <label className="action-row"><input type="checkbox" checked={settings.engine?.full ?? false} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, full: event.target.checked } })} /> Stockfish Full · около 95 МиБ при первом запуске</label>
       <div className="action-row"><a href="#endgames">Эндшпили</a><a href="#openings">Дебюты</a><a href="#methodology">Методология</a></div>
     </section>

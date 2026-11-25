@@ -1,6 +1,9 @@
 import { Chess, DEFAULT_POSITION, type Color, type Move, type Square } from 'chess.js'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeftRight, ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Cpu, Flag, Pause, Play, RotateCcw, ScanLine, Target } from 'lucide-react'
+import { AnalysisProgress, useLiveReview } from './AnalysisProgress'
+import { PlayerBadge } from './PlayerCard'
+import { profileSource } from './playerProfiles'
 import { Board } from './Board'
 import { Chart } from './Charts'
 import { coachingPrinciple } from './coach'
@@ -20,10 +23,10 @@ export function Empty({ title, message, children }: { title: string; message?: s
 }
 
 type Props = {
-  game?: Game; initialPly?: number; games: Game[]; nickname: string; mode: Mode; active?: string; eta?: number; options?: EngineOptions;
+  game?: Game; initialPly?: number; games: Game[]; nickname: string; mode: Mode; active?: string; options?: EngineOptions;
   onQueue: (game: Game, mode: Mode) => void; onPause: (game: Game) => void; onImport: () => void;
 }
-export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode, active, eta, options, onQueue, onPause, onImport }: Props) {
+export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode, active, options, onQueue, onPause, onImport }: Props) {
   const [snapshot, setSnapshot] = useState('')
   const saved = base?.savedAnalyses?.find(item => analysisKey(item) === snapshot)
   const game = saved && base ? { ...base, ...saved } : base
@@ -42,13 +45,20 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   const controller = useRef<AbortController>(undefined)
   useEffect(() => () => controller.current?.abort(), [])
   const clocks = useMemo(() => game && /%clk|%emt/.test(game.pgn) ? readClocks(game.pgn, moves, game.time) : [], [game?.pgn, moves, game?.time])
-  const reviews = game?.reviews ?? []
+  const live = useLiveReview(base?.id)
+  const reviews = saved ? saved.reviews : live && live.length > (base?.reviews?.length ?? 0) ? live : base?.reviews ?? []
   const last = moves[index - 1]
   const verified = !saved ? checked[index - 1] : undefined
   const review = verified ?? reviews[index - 1]
   const position = branches.at(-1)?.after ?? last?.after ?? game?.initial ?? DEFAULT_POSITION
   const completed = game && isComplete(game)
-  const nextPosition = reviews[index]
+  const arrow = reviews[index]?.before.pv[0] ?? review?.after.pv[0]
+  const arrows = useMemo(() => arrow && !branches.length ? [arrow] : [], [arrow, branches.length])
+  const materialBalance = useMemo(() => material(new Chess(position), 'w'), [position])
+  const swipe = useCallback((direction: -1 | 1) => {
+    setBranches([])
+    setIndex(previous => Math.max(0, Math.min(moves.length, previous + direction)))
+  }, [moves.length])
   const navigable = (i: number) => Math.max(0, Math.min(moves.length, i))
   function navigate(i: number) { setBranches([]); setIndex(navigable(i)) }
   useEffect(() => {
@@ -68,8 +78,16 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
     window.addEventListener('keydown', keyboard)
     return () => window.removeEventListener('keydown', keyboard)
   }, [moves.length])
+  const tryMove = useCallback((from: Square, to: Square, promotion?: string) => {
+    const chess = new Chess(position)
+    try { setBranches(previous => [...previous, chess.move({ from, to, promotion })]) } catch { /* Board only offers legal moves. */ }
+  }, [position])
   if (!game) return <div className="panel"><Empty title="Выберите завершённую партию" message="Импортируйте историю или загрузите PGN, чтобы начать разбор."><button className="primary" onClick={onImport}>Импортировать партию</button></Empty></div>
 
+  const owner = playerColor(game, nickname)
+  const source = profileSource(game)
+  const player = (color: Color) => <PlayerBadge key={color + ':' + game.id} source={source}
+    name={color === 'w' ? game.white : game.black} rating={color === 'w' ? game.whiteElo : game.blackElo} color={color} owner={owner === color} />
   const landmarks = [...reviews].filter(item => errors.includes(item.category) || ['brilliant','great'].includes(item.category))
   const rankedErrors = landmarks.filter(item => errors.includes(item.category)).sort((a, b) => b.loss - a.loss)
   const bestMoves = [...reviews].filter(item => ['brilliant', 'great'].includes(item.category))
@@ -77,9 +95,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   const nextError = landmarks.find(item => item.index + 1 > index && errors.includes(item.category))
   const nextGuided = landmarks.find(item => item.index + 1 > index)
   const white = summarize(reviews, 'w'), black = summarize(reviews, 'b')
-  const main = nextPosition?.before.pv[0] ?? (review?.after.pv[0])
   const clock = clocks[index - 1]
-  const materialBalance = material(new Chess(position), 'w')
   const pressureErrors = rankedErrors.filter(item => {
     const remaining = clocks[item.index]?.remaining
     return remaining !== undefined && remaining <= 30
@@ -102,7 +118,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   }
   function download() {
     if (!game) return
-    const url = URL.createObjectURL(new Blob([annotatedPgn(game)], { type: 'application/x-chess-pgn;charset=utf-8' }))
+    const url = URL.createObjectURL(new Blob([annotatedPgn({ ...game, reviews })], { type: 'application/x-chess-pgn;charset=utf-8' }))
     const link = document.createElement('a')
     link.href = url
     link.download = 'chessmind-' + game.id.slice(0, 8) + '.pgn'
@@ -115,10 +131,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
     if (!steps.length) return
     setBranches([steps[0]])
   }
-  function tryMove(from: Square, to: Square, promotion?: string) {
-    const chess = new Chess(position)
-    try { setBranches(previous => [...previous, chess.move({ from, to, promotion })]) } catch { /* Board only offers legal moves. */ }
-  }
+
   const controls = <>
     <button className="icon-btn" aria-label="Начало партии" onClick={() => navigate(0)}><ChevronFirst /></button>
     <button className="icon-btn" aria-label="Назад" onClick={() => navigate(index - 1)}><ChevronLeft /></button>
@@ -130,7 +143,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   return <>
     <section className="panel review-header">
       <div><div className="eyebrow">{game.source === 'chesscom' ? 'Chess.com' : game.source === 'lichess' ? 'Lichess' : 'PGN'} · {timeLabel(game.time)}</div>
-        <h2>{game.white} <span>{game.whiteElo}</span> <small>–</small> {game.black} <span>{game.blackElo}</span></h2>
+        <h2>{game.white} <span>{game.whiteElo ?? '—'}</span> <small>–</small> {game.black} <span>{game.blackElo ?? '—'}</span></h2>
         <p>{game.result} {game.opening ? ' · ' + game.opening[0] + ' ' + game.opening[1] : ''}</p></div>
       <div className="run-controls">
         {base?.savedAnalyses?.length ? <select aria-label="Сохранённый анализ" value={saved ? snapshot : ''} onChange={event => setSnapshot(event.target.value)}>
@@ -146,20 +159,21 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
           <button className="primary" disabled={!!saved || checking !== undefined || !!completed && sameProfile} onClick={() => onQueue(game, speed)}><Cpu size={17} />{completed && sameProfile ? 'Анализ готов' : reviews.length && sameProfile ? 'Продолжить' : 'Начать анализ'}</button>}
         {reviews.length > 0 && <button onClick={download}>PGN с разбором</button>}
       </div>
-      {(game.queued || reviews.length > 0 && !completed) && <label className="progress-label">
-        <span>{active === game.id ? 'Анализ Stockfish' : game.queued ? 'В очереди' : 'Приостановлено'}</span><progress max={moves.length} value={reviews.length} /><span>{reviews.length}/{moves.length}{active === game.id && !!eta && ' · ≈ ' + (eta >= 60 ? Math.ceil(eta / 60) + ' мин' : eta + ' с')}</span>
-      </label>}
+      {!saved && (game.queued || reviews.length > 0 && !completed) && <>
+        <AnalysisProgress id={game.id} done={reviews.length} total={moves.length} running={active === game.id && !!game.queued} queued={!!game.queued} />
+        {reviews.length > index && <button className="jump-analyzed" onClick={() => navigate(reviews.length)}>К последнему готовому ходу</button>}
+      </> }
     </section>
     <div className="review-layout">
       <section className="board-column">
-        <div className="player-line"><span className={'player-stone ' + (orientation === 'b' ? 'white' : 'black')} />{orientation === 'b' ? game.white : game.black}</div>
+        <div className="player-line">{player(orientation === 'b' ? 'w' : 'b')}</div>
         <div className="evaluation-layout">
           <div className="eval-bar" aria-label="Преимущество"><div style={{ height: expectation(review?.after ?? reviews[0]?.before ?? { kind: 'cp', value: 0, depth: 0, pv: [] }, orientation) + '%' }} /><span>{evalLabel(review?.after ?? reviews[0]?.before)}</span></div>
           <Board fen={position} orientation={orientation} last={branches.at(-1) ?? last}
             accent={review && errors.includes(review.category) && !branches.length ? categories[review.category][2] : undefined}
-            arrows={main && !branches.length ? [main] : []} onMove={tryMove} onSwipe={direction => navigate(index + direction)} />
+            arrows={arrows} onMove={tryMove} onSwipe={swipe} />
         </div>
-        <div className="player-line"><span className={'player-stone ' + (orientation === 'w' ? 'white' : 'black')} />{orientation === 'w' ? game.white : game.black}</div>
+        <div className="player-line">{player(orientation)}</div>
         <div className="board-controls">{controls}</div>
         <div className="board-context"><strong>{last ? last.before.split(' ')[5] + (last.color === 'w' ? '. ' : '… ') + last.san : 'Начальная позиция'}</strong>
           <span>Материал Б/Ч {materialBalance > 0 ? '+' : ''}{materialBalance}</span>

@@ -1,10 +1,10 @@
 import { Chess, type Color, type Move, type PieceSymbol, type Square } from 'chess.js'
-import { Engine, type Position } from './engine'
+import { Engine, type Position, type SearchSpeed } from './engine'
 import { analysisKey, gameMoves, playUci, uci, type Game, type Mode } from './library'
 import { explain } from './coach'
 import { drawState, positionKey } from './rules'
 
-export type Line = { kind: 'cp' | 'mate'; value: number; wdl?: [number, number, number]; pv: string[]; depth: number; stable?: boolean; engine?: string }
+export type Line = { kind: 'cp' | 'mate'; value: number; wdl?: [number, number, number]; pv: string[]; depth: number; stable?: boolean; engine?: string; nodes?: number }
 export const categories = {
   brilliant: ['Блестящий', '!!', '#46a9a0'], great: ['Великолепный', '!', '#6394c7'],
   best: ['Лучший', '★', '#77936b'], excellent: ['Отличный', '✓', '#739065'],
@@ -53,14 +53,18 @@ export function variation(fen: string, pv: string[], limit = 12) {
   return steps
 }
 function sacrificeEvidence(move: Move, reply: Line) {
-  const start = material(new Chess(move.before), move.color)
+  if (!reply.pv.length) return undefined
   const trail = variation(move.after, reply.pv, 10)
-  const balances = trail.map(step => material(new Chess(step.after), move.color) - start)
-  const conceded = trail.some((step, index) => step.color !== move.color &&
-    step.captured && pieceValue[step.captured] >= 3 && balances[index] <= -2)
+  const delta = (step: Move) => (step.captured ? pieceValue[step.captured] : 0) + (step.promotion ? pieceValue[step.promotion] - 1 : 0)
+  let balance = delta(move)
+  let conceded = false
+  for (const step of trail) {
+    const opponent = step.color !== move.color
+    balance += delta(step) * (opponent ? -1 : 1)
+    if (opponent && step.captured && pieceValue[step.captured] >= 3 && balance <= -2) conceded = true
+  }
   if (!conceded) return undefined
-  const last = balances.at(-1)!
-  if (last > -2) return 'Псевдожертва'
+  if (balance > -2) return 'Псевдожертва'
   if (trail.length < 5) return undefined
   return trail.some(step => step.color === move.color && step.san.endsWith('+')) ? 'Тактическая жертва' : 'Позиционная жертва'
 }
@@ -70,7 +74,7 @@ export function sacrifice(move: Move, reply: Line) {
   return evidence !== undefined && evidence !== 'Псевдожертва'
 }
 
-export function assess(lines: Line[], played: Line, move: Move, after: Line, book: boolean, checked: boolean, baseline = lines[0]) {
+export function assess(lines: Line[], played: Line, move: Move, after: Line, book: boolean, checked: boolean, baseline = lines[0], legal?: number) {
   const best = baseline
   const color = move.color
   const wdl = !!best.wdl && !!played.wdl
@@ -80,7 +84,7 @@ export function assess(lines: Line[], played: Line, move: Move, after: Line, boo
   const cpLoss = best.kind === 'cp' && played.kind === 'cp' ? Math.max(0, fromMover(best, color) - fromMover(played, color)) : null
   const gap = lines[1] ? expectation(lines[0], color, !!lines[0].wdl && !!lines[1].wdl) - expectation(lines[1], color, !!best.wdl && !!lines[1].wdl) : 0
   const top = lines[0].pv[0] === uci(move)
-  const forced = move.before !== move.after && new Chess(move.before).moves().length === 1
+  const forced = (legal ?? new Chess(move.before).perft(1)) === 1
   const lostMate = best.kind === 'mate' && fromMover(best, color) > 0 && !(played.kind === 'mate' && fromMover(played, color) > 0)
   const allowsMate = played.kind === 'mate' && fromMover(played, color) < 0 && !(best.kind === 'mate' && fromMover(best, color) < 0)
   const equivalent = (cpLoss !== null && cpLoss <= 15 && loss <= 2) ||
@@ -137,49 +141,95 @@ function phaseFor(move: Move, index: number, book: number): Phase {
 
 function positionsFor(game: Game, moves: Move[]) {
   const seen = new Map([[positionKey(game.initial), 1]])
-  const played: string[] = []
-  const positions: Position[] = [{ initial: game.initial, moves: [], fen: game.initial }]
+  let initial = game.initial
+  let played: string[] = []
+  const positions: Position[] = [{ initial, moves: [], fen: initial, legal: new Chess(initial).perft(1) }]
   for (const move of moves) {
-    played.push(uci(move))
     const key = positionKey(move.after)
     const repetitions = (seen.get(key) ?? 0) + 1
     seen.set(key, repetitions)
-    positions.push({ initial: game.initial, moves: [...played], fen: move.after, repetitions })
+    // A pawn move, capture or change in castling rights makes earlier positions
+    // unreachable for repetition. The saved FEN retains the clock and move count.
+    if (move.piece === 'p' || move.captured || move.before.split(' ')[2] !== move.after.split(' ')[2]) {
+      initial = move.after
+      played = []
+    } else played.push(uci(move))
+    positions.push({ initial, moves: [...played], fen: move.after, repetitions, legal: new Chess(move.after).perft(1) })
   }
   return positions
 }
 
-async function analyzeMove(game: Game, mode: Mode, engine: Engine, index: number, moves: Move[], positions: Position[], root?: Line[], force = false) {
+type Root = { lines: Line[]; deep: boolean }
+
+async function analyzeMove(game: Game, mode: Mode, engine: Engine, index: number, moves: Move[], positions: Position[], historyRoot?: Root, force = false) {
   const move = moves[index]
   const notation = uci(move)
-  const terminal = drawState(new Chess(move.after), positions[index + 1].repetitions)
-  const next = await engine.evaluate(positions[index + 1], mode)
-  let after = next[0]
-  let lines = root ?? await engine.evaluate(positions[index], mode)
-  async function compare(critical: boolean) {
-    const best = lines[0]
-    const inMulti = lines.find(line => line.pv[0] === notation)
+  const current = positions[index], child = positions[index + 1]
+  const terminal = drawState(new Chess(move.after), child.repetitions, child.legal)
+  let root = historyRoot ?? { lines: await engine.evaluate(current, mode, force), deep: force }
+  async function compare() {
+    const best = root.lines[0]
+    const inMulti = root.lines.find(line => line.pv[0] === notation)
     if (inMulti || !best.pv.length) return { best, played: inMulti ?? best }
-    const search = async (move: string, depth: number) =>
-      (await engine.evaluate(positions[index], mode, critical, move, depth))[0]
-    let played = await search(notation, best.depth)
-    let baseline = await search(best.pv[0], Math.min(best.depth, played.depth))
-    if (baseline.depth < played.depth) played = await search(notation, baseline.depth)
-    return { best: baseline, played }
+    const search = async (move: string, depth: number) => (await engine.evaluate(current, mode, root.deep, move, depth))[0]
+    const played = await search(notation, best.depth)
+    const sameKind = played.kind === best.kind
+    const mateAgrees = sameKind && best.kind === 'mate' && Math.sign(played.value) === Math.sign(best.value)
+    if (!force && played.depth === best.depth && (sameKind && best.kind === 'cp' || mateAgrees)) return { best, played }
+
+    // Lower depth or a different mate assessment needs a common independent check.
+    const paired = await engine.evaluate(current, mode, root.deep, [best.pv[0], notation], best.depth)
+    const baseline = paired.find(line => line.pv[0] === best.pv[0])!
+    const candidate = paired.find(line => line.pv[0] === notation)!
+    const agrees = baseline.kind === best.kind &&
+      (best.kind === 'mate' ? Math.sign(baseline.value) === Math.sign(best.value) : Math.abs(baseline.value - best.value) <= 35)
+    if (baseline.depth >= best.depth && agrees) return { best: baseline, played: candidate }
+
+    const reference = await search(best.pv[0], Math.min(best.depth, played.depth))
+    const independent = reference.depth < played.depth ? await search(notation, reference.depth) : played
+    return { best: reference, played: independent }
   }
-  let pair = await compare(false)
-  let result = assess(lines, pair.played, move, after, index < game.book, false, pair.best)
-  const critical = force || !result.forced && !!lines[0].pv.length &&
-    (result.loss >= 7 || result.gap >= 14 || result.lostMate || result.allowsMate || sacrifice(move, after))
-  if (critical) {
-    lines = await engine.evaluate(positions[index], mode, true)
-    pair = await compare(true)
-    after = (await engine.evaluate(positions[index + 1], mode, true))[0]
-    result = assess(lines, pair.played, move, after, index < game.book, true, pair.best)
+  let pair = await compare()
+  const classify = (after: Line, verified: boolean) =>
+    assess(root.lines, pair.played, move, after, index < game.book, verified, pair.best, current.legal)
+  const baseChild = { lines: await engine.evaluate(child, mode, force), deep: force }
+  const preliminary = classify(baseChild.lines[0], false)
+  const critical = force || !preliminary.forced && !!root.lines[0].pv.length &&
+    (preliminary.loss >= 7 || preliminary.gap >= 14 || preliminary.lostMate || preliminary.allowsMate || sacrifice(move, baseChild.lines[0]))
+  if (critical && !root.deep) {
+    root = { lines: await engine.evaluate(current, mode, true), deep: true }
+    pair = await compare()
+  }
+
+  let next = baseChild
+  let after = next.lines[0]
+  if (critical && !force && !move.captured && !preliminary.forced) {
+    const candidate = classify(after, true)
+    const canBeBrilliant = candidate.reliable && candidate.loss <= 1 && (candidate.cpLoss === null || candidate.cpLoss <= 12) &&
+      candidate.gap >= 5 && expectation(pair.played, move.color) >= 65 &&
+      (candidate.sacrificeType === 'Тактическая жертва' || candidate.sacrificeType === 'Позиционная жертва')
+    if (canBeBrilliant) {
+      next = { lines: await engine.evaluate(child, mode, true), deep: true }
+      after = next.lines[0]
+    }
+  }
+  // The played root line already searched the opponent's response. Use that
+  // continuation when it carries a deeper exact iteration than the child search.
+  const played = pair.played
+  if (!next.deep && played.stable && played.pv[0] === notation && played.pv.length > 1 && played.depth - 1 > after.depth) {
+    const matesWithMove = played.kind === 'mate' && (played.value > 0) === (move.color === 'w')
+    const value = matesWithMove ? played.value - Math.sign(played.value) : played.value
+    if (value !== 0 || played.kind !== 'mate') after = { ...played, value, depth: played.depth - 1, pv: played.pv.slice(1) }
+  }
+  let result = classify(after, critical)
+  if (result.category === 'brilliant' && !next.deep) {
+    next = { lines: await engine.evaluate(child, mode, true), deep: true }
+    after = next.lines[0]
+    result = classify(after, critical)
   }
   const phase = phaseFor(move, index, game.book)
   const rationale = explain(move, pair.best, pair.played, after, result, phase)
-  const review: Review = { color: move.color, index, before: pair.best, played: pair.played, after, lines,
+  const review: Review = { color: move.color, index, before: pair.best, played: pair.played, after, lines: root.lines,
     ...result, ...rationale, accuracy: moveAccuracy(result.loss), phase, critical,
     depth: Math.min(pair.best.depth, pair.played.depth), draw: terminal?.label }
   return { review, next }
@@ -187,26 +237,27 @@ async function analyzeMove(game: Game, mode: Mode, engine: Engine, index: number
 
 export async function recheckMove(game: Game, index: number, signal: AbortSignal) {
   const moves = gameMoves(game)
-  const engine = new Engine(signal, game.options)
+  const engine = new Engine(signal, game.options, undefined, game.id)
   try { return (await analyzeMove(game, 'professional', engine, index, moves, positionsFor(game, moves), undefined, true)).review }
-  finally { engine.close() }
+  finally { engine.close(); await engine.flush() }
 }
 
-export async function analyzeGame(game: Game, mode: Mode, signal: AbortSignal, save: (review: Review[]) => Promise<void>) {
+export async function analyzeGame(game: Game, mode: Mode, signal: AbortSignal, save: (review: Review[]) => Promise<void>,
+  report?: (sample: SearchSpeed) => void) {
   const moves = gameMoves(game)
-  const engine = new Engine(signal, game.options)
+  const engine = new Engine(signal, game.options, report, game.id)
   const reviews = game.methodology === 2 && game.mode === mode ? [...(game.reviews ?? [])] : []
   const positions = positionsFor(game, moves)
-  let root: Line[] | undefined
+  let root: Root | undefined
   try {
     for (let i = reviews.length; i < moves.length; i++) {
-      if (signal.aborted) throw new DOMException('Пауза', 'AbortError')
+      signal.throwIfAborted()
       const current = await analyzeMove(game, mode, engine, i, moves, positions, root)
       root = current.next
       reviews.push(current.review)
-      if (!signal.aborted) await save([...reviews])
+      if (!signal.aborted) await save(reviews)
     }
-  } finally { engine.close() }
+  } finally { engine.close(); await engine.flush() }
 }
 
 export function average(values: number[]) {

@@ -11,7 +11,7 @@ export type Analysis = { mode: Mode; methodology?: 1 | 2; options?: EngineOption
 export const methodologyVersion = 2
 export const analysisKey = (game: Pick<Game, 'methodology' | 'mode' | 'options'>) =>
   [game.methodology ?? 1, game.mode ?? 'standard', game.options?.full ? 'full' : 'lite',
-    game.options?.multiplier ?? 1, game.options?.threads ?? 'auto', game.options?.hash ?? 16].join(':')
+    game.options?.multiplier ?? 1, game.options?.threads ?? 'auto', game.options?.hash ?? 'auto'].join(':')
 export type Game = {
   id: string; pgn: string; initial: string; source: Source; url?: string; owner?: string;
   white: string; black: string; whiteElo?: number; blackElo?: number;
@@ -109,17 +109,26 @@ export async function parsePgn(pgn: string, source: Source = 'pgn', owner?: stri
   const identity = [headers.White?.toLowerCase(), headers.Black?.toLowerCase(), timestamp ?? date, result, initial, history.map(uci).join(' ')].join('|')
   const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity))
   const id = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('')
-  const rating = (value: string) => /^\d+$/.test(value) ? Number(value) : undefined
+  const rating = (value: string) => /^\d+$/.test(value) ? historicalRating(Number(value)) : undefined
   return { id, pgn, initial, source, owner, url, white: headers.White === '?' ? 'Белые' : headers.White || 'Белые',
     black: headers.Black === '?' ? 'Чёрные' : headers.Black || 'Чёрные',
     whiteElo: rating(headers.WhiteElo), blackElo: rating(headers.BlackElo),
     date, timestamp, result, time: headers.TimeControl && headers.TimeControl !== '-' ? headers.TimeControl : '', opening, book, moves: history.length }
 }
 
+export const historicalRating = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+
 export async function storeGame(game: Game) {
   const transaction = (await db).transaction('games', 'readwrite')
   const saved = await transaction.store.get(game.id) ?? (game.url ? await transaction.store.index('url').get(game.url) : undefined)
-  if (saved && game.owner && !saved.owner) await transaction.store.put({ ...saved, source: game.source, owner: game.owner, url: game.url })
+  if (saved) {
+    const owner = game.owner && !saved.owner ? { source: game.source, owner: game.owner, url: game.url } : {}
+    const whiteElo = saved.whiteElo ?? game.whiteElo
+    const blackElo = saved.blackElo ?? game.blackElo
+    if (owner.owner || whiteElo !== saved.whiteElo || blackElo !== saved.blackElo) {
+      await transaction.store.put({ ...saved, ...owner, whiteElo, blackElo })
+    }
+  }
   if (!saved) await transaction.store.put(game)
   await transaction.done
   return !saved
@@ -253,6 +262,8 @@ export async function importAccount(
         const item = JSON.parse(row)
         if (item.variant !== 'standard' || ['created', 'started', 'aborted'].includes(item.status) || typeof item.pgn !== 'string') { invalid++; continue }
         const game = await parsePgn(item.pgn, source, name, 'https://lichess.org/' + item.id)
+        game.whiteElo ??= historicalRating(item.players?.white?.rating)
+        game.blackElo ??= historicalRating(item.players?.black?.rating)
         if (Number.isSafeInteger(item.createdAt)) game.timestamp = item.createdAt
         if (await storeGame(game)) added++
         else skipped++
@@ -278,7 +289,7 @@ export async function importAccount(
   let warning = ''
   for (const [index, archive] of batch.entries()) {
     onProgress('Chess.com · архив ' + (index + 1) + ' из ' + batch.length)
-    let games: Array<{ pgn?: string; rules: string; url: string }>
+    let games: Array<{ pgn?: string; rules: string; url: string; white?: { rating?: number }; black?: { rating?: number } }>
     try {
       const payload = await (await request(archive, undefined, signal, onProgress)).json()
       if (!Array.isArray(payload.games)) throw new Error('Неверный формат архива.')
@@ -292,7 +303,10 @@ export async function importAccount(
       signal?.throwIfAborted()
       if (!item.pgn || item.rules !== 'chess') { invalid++; continue }
       try {
-        if (await storeGame(await parsePgn(item.pgn, source, name, item.url))) added++
+        const game = await parsePgn(item.pgn, source, name, item.url)
+        game.whiteElo ??= historicalRating(item.white?.rating)
+        game.blackElo ??= historicalRating(item.black?.rating)
+        if (await storeGame(game)) added++
         else skipped++
       } catch { invalid++ }
     }

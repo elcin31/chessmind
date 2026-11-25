@@ -138,7 +138,7 @@ function TaskView({ task, onPractice, next, canNext, multi }: {
     const current = new AbortController()
     controller.current = current
     setPending(true)
-    const engine = new Engine(current.signal, game.options)
+    const engine = new Engine(current.signal, game.options, undefined, game.id)
     try {
       const candidate = new Chess(fen).move({ from, to, promotion })
       const notation = uci(candidate)
@@ -177,7 +177,7 @@ function TaskView({ task, onPractice, next, canNext, multi }: {
 
     } catch (error) {
       if (!current.signal.aborted) setFeedback(error instanceof Error ? error.message : 'Не удалось проверить ход.')
-    } finally { engine.close(); if (!current.signal.aborted) setPending(false) }
+    } finally { engine.close(); void engine.flush(); if (!current.signal.aborted) setPending(false) }
   }
   return <div className="review-layout training-layout">
     <Board fen={solution ? line[step - 1]?.after ?? move.before : fen} orientation={move.color} last={solution ? line[step - 1] : path.at(-1)} arrows={hint && !solution ? [path.length ? expected[0] : review.before.pv[0]] : []} onMove={!solution ? tryMove : undefined} />
