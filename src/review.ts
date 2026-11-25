@@ -194,8 +194,14 @@ async function analyzeMove(game: Game, mode: Mode, engine: Engine, index: number
     assess(root.lines, pair.played, move, after, index < game.book, verified, pair.best, current.legal)
   const baseChild = { lines: await engine.evaluate(child, mode, force), deep: force }
   const preliminary = classify(baseChild.lines[0], false)
+  const childLine = baseChild.lines[0]
+  const expressDisagreement = mode === 'quick' && pair.played.depth > 0 && childLine.depth > 0 &&
+    (pair.played.kind === 'cp' && childLine.kind === 'cp' &&
+      fromMover(pair.played, move.color) - fromMover(childLine, move.color) >= 60 ||
+      expectation(pair.played, move.color, !!pair.played.wdl && !!childLine.wdl) -
+      expectation(childLine, move.color, !!pair.played.wdl && !!childLine.wdl) >= 10)
   const critical = force || !preliminary.forced && !!root.lines[0].pv.length &&
-    (preliminary.loss >= 7 || preliminary.gap >= 14 || preliminary.lostMate || preliminary.allowsMate || sacrifice(move, baseChild.lines[0]))
+    (expressDisagreement || preliminary.loss >= 7 || preliminary.gap >= 14 || preliminary.lostMate || preliminary.allowsMate || sacrifice(move, baseChild.lines[0]))
   if (critical && !root.deep) {
     root = { lines: await engine.evaluate(current, mode, true), deep: true }
     pair = await compare()
