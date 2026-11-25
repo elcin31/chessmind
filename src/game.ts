@@ -6,20 +6,22 @@ import { drawState } from './rules.js'
 
 export type Source = 'chesscom' | 'lichess' | 'pgn'
 export type Opening = [eco: string, name: string, pgn: string]
-export type Mode = 'quick' | 'standard' | 'deep' | 'professional'
+export type Mode = 'lite' | 'quick' | 'standard' | 'deep' | 'professional'
 export type EngineOptions = { multiplier?: number; full?: boolean; threads?: 1 | 2; hash?: 16 | 32 | 64; cache?: number; workers?: 1 | 2 | 3 | 4; energy?: Energy }
 export type Analysis = { mode: Mode; compute?: ComputeEngine; methodology?: 1 | 2; options?: EngineOptions; reviews: Review[] }
 export const methodologyVersion = 2
 export const cloudEngine = 'stockfish-19.0.1-lite-single' as const
 export const analysisKey = (game: Pick<Game, 'methodology' | 'mode' | 'options' | 'compute'>) =>
-  [game.methodology ?? 1, game.mode ?? 'standard', game.options?.full ? 'full' : 'lite',
-    game.options?.multiplier ?? 1, game.options?.threads ?? 'auto', game.options?.hash ?? 'auto',
+  [game.methodology ?? 1, game.mode ?? 'standard',
+    ...(game.mode === 'lite' ? ['lite', 1, 1, 16] : [
+      game.options?.full ? 'full' : 'lite', game.options?.multiplier ?? 1, game.options?.threads ?? 'auto', game.options?.hash ?? 'auto',
+    ]),
     ...(game.compute === 'cloud' ? ['cloud', cloudEngine] : [])].join(':')
 export type Game = {
   id: string; pgn: string; initial: string; source: Source; url?: string; owner?: string;
   white: string; black: string; whiteElo?: number; blackElo?: number;
   date: string; timestamp?: number; result: string; time: string; opening?: Opening; book: number;
-  moves: number; mode?: Mode; reviews?: Review[]; queued?: boolean; queuedAt?: number; methodology?: 1 | 2; options?: EngineOptions; savedAnalyses?: Analysis[]; draft?: Draft; cloudDraft?: Draft; cloudCacheHit?: boolean; localElapsedMs?: number; queueSource?: ComputeSource; compute?: ComputeEngine; autoPreviewPaused?: boolean
+  moves: number; mode?: Mode; reviews?: Review[]; queued?: boolean; queuedAt?: number; methodology?: 1 | 2; options?: EngineOptions; savedAnalyses?: Analysis[]; draft?: Draft; cloudDraft?: Draft; cloudCacheHit?: boolean; localElapsedMs?: number; queueSource?: ComputeSource; compute?: ComputeEngine; autoPreviewPaused?: boolean; loadPaused?: boolean
 }
 export const uci = (move: Move) => move.from + move.to + (move.promotion ?? '')
 export const fenKey = (fen: string) => fen.split(' ').slice(0, 4).join(' ')

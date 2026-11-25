@@ -8,18 +8,18 @@ import { immortal, opera } from '../tests/fixtures.ts'
 const [url, output] = process.argv.slice(2)
 if (!url || !output) throw new Error('node --import tsx scripts/benchmark.mjs <url> <output.ndjson>')
 
-function memory(profile) {
+function resources(profile) {
   const processes = readdirSync('/proc').filter(item => /^\d+$/.test(item)).flatMap(id => {
     try {
       const stat = readFileSync('/proc/' + id + '/stat', 'utf8').split(') ').at(-1).split(' ')
-      return [{ id: Number(id), parent: Number(stat[1]) }]
+      return [{ id: Number(id), parent: Number(stat[1]), cpu: Number(stat[11]) + Number(stat[12]) }]
     } catch { return [] }
   })
   const root = processes.find(({ id }) => {
     try { return readFileSync('/proc/' + id + '/cmdline', 'utf8').includes('--user-data-dir=' + profile + '\0') }
     catch { return false }
   })
-  if (!root) return 0
+  if (!root) return { pss: 0, cpu: 0 }
   const ids = [root.id]
   let pss = 0
   for (const id of ids) {
@@ -27,7 +27,7 @@ function memory(profile) {
     try { pss += Number(readFileSync('/proc/' + id + '/smaps_rollup', 'utf8').match(/^Pss:\s+(\d+)/m)?.[1] ?? 0) }
     catch { /* A Chromium process exited between samples. */ }
   }
-  return pss
+  return { pss, cpu: processes.reduce((total, item) => total + (ids.includes(item.id) ? item.cpu : 0), 0) }
 }
 
 const { appendFileSync } = await import('node:fs')
@@ -49,20 +49,38 @@ const games = rawGames.map(([pgn, name]) => {
 const threads = process.env.BENCH_THREADS === 'auto' ? undefined : 1
 const requestedWorkers = Number(process.env.BENCH_WORKERS) || undefined
 const cores = Number(process.env.BENCH_CORES) || undefined
+const memoryGiB = Number(process.env.BENCH_MEMORY) || undefined
+const energy = process.env.BENCH_ENERGY ?? 'balanced'
+const mobile = process.env.BENCH_MOBILE === '1'
+const cpuHz = Number(process.env.BENCH_CPU_HZ ?? 100)
 for (const mode of profiles) {
   const profile = mkdtempSync(join(tmpdir(), 'chessbench-'))
   const context = await chromium.launchPersistentContext(profile, {
     executablePath: process.env.CHROMIUM_PATH ?? '/usr/bin/chromium',
     viewport: { width: 402, height: 874 },
+    ...(mobile ? { isMobile: true, hasTouch: true, userAgent: 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36' } : {}),
   })
   try {
-    await context.addInitScript(({ threads, requestedWorkers, cores }) => {
+    await context.addInitScript(({ threads, requestedWorkers, cores, memoryGiB, energy }) => {
       if (cores) Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => cores })
-      localStorage.setItem('chessmind-settings', JSON.stringify({ theme: 'system', nickname: '', engine: { threads, hash: 16, workers: requestedWorkers } }))
+      if (memoryGiB) Object.defineProperty(navigator, 'deviceMemory', { get: () => memoryGiB })
+      let previousTick = performance.now()
+      setInterval(() => {
+        const now = performance.now()
+        if (window.bench.start) window.bench.lag.push(Math.max(0, now - previousTick - 50))
+        previousTick = now
+      }, 50)
+      localStorage.setItem('chessmind-settings', JSON.stringify({ theme: 'system', nickname: '', engine: { threads, hash: 16, workers: requestedWorkers, energy } }))
       const original = Worker.prototype.postMessage
       const observed = new WeakMap()
       window.bench = { searches: 0, nodes: 0, depths: 0, peakWorkers: 0, peakThreads: 0, phases: {} }
       const running = new Set()
+      let activeSince = 0, idleSince = 0, continuousMs = 0
+      const observeIdle = now => {
+        const idle = now - idleSince
+        if (idle < 100) continuousMs += idle
+        else continuousMs = 0
+      }
       const observer = new MutationObserver(() => {
         if (!window.bench.start) return
         const node = document.querySelector('.analysis-progress')
@@ -88,6 +106,13 @@ for (const mode of profiles) {
                 if (depth) search.depth = Math.max(search.depth, Number(depth))
                 if (line.startsWith('bestmove')) {
                   running.delete(this)
+                  if (!running.size) {
+                    idleSince = performance.now()
+                    const active = idleSince - activeSince
+                    window.bench.activeMs += active
+                    continuousMs += active
+                    window.bench.longestMs = Math.max(continuousMs, window.bench.longestMs)
+                  }
                   window.bench.nodes += search.nodes
                   window.bench.depths += search.depth
                 }
@@ -96,13 +121,19 @@ for (const mode of profiles) {
           }
           search.nodes = search.depth = 0
           window.bench.searches++
+          if (!running.size) {
+            activeSince = performance.now()
+            if (window.bench.searches === 1) continuousMs = 0
+            else observeIdle(activeSince)
+          }
           running.add(this)
           window.bench.peakWorkers = Math.max(running.size, window.bench.peakWorkers)
         }
         return original.call(this, message, ...options)
       }
-    }, { threads, requestedWorkers, cores })
+    }, { threads, requestedWorkers, cores, memoryGiB, energy })
     const page = context.pages()[0]
+    page.on('dialog', dialog => dialog.accept())
     await page.goto(url)
     await page.getByText('Офлайн готов').waitFor({ timeout: 30_000 })
     await page.getByRole('button', { name: 'PGN', exact: true }).click()
@@ -112,15 +143,17 @@ for (const mode of profiles) {
       await page.locator('.recent-list button').filter({ hasText: name }).click()
       await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption(mode)
       await page.evaluate(() => Object.assign(window.bench, {
-        searches: 0, nodes: 0, depths: 0, peakWorkers: 0, peakThreads: 0, phases: {}, start: performance.now(),
+        searches: 0, nodes: 0, depths: 0, peakWorkers: 0, peakThreads: 0, phases: {}, activeMs: 0, longestMs: 0, lag: [], start: performance.now(),
       }))
-      const idlePss = memory(profile)
-      let peakPss = idlePss
-      const sample = setInterval(() => { peakPss = Math.max(peakPss, memory(profile)) }, 1500)
+      const idle = resources(profile)
+      let peakPss = idle.pss
+      const sample = setInterval(() => { peakPss = Math.max(peakPss, resources(profile).pss) }, 350)
       const start = performance.now()
       try {
         await page.getByRole('button', { name: 'Начать анализ' }).click()
-        await page.getByRole('heading', { name: /Итоги партии/ }).waitFor({ timeout: 600_000 })
+        await page.getByRole('heading', { name: /Итоги партии/ }).or(page.locator('.banner[role="alert"]')).first().waitFor({ timeout: 600_000 })
+        const failure = page.locator('.banner[role="alert"]')
+        if (await failure.count()) throw new Error(await failure.innerText())
         const seconds = (performance.now() - start) / 1000
         const data = await page.evaluate(async name => {
           const records = await new Promise((resolve, reject) => {
@@ -146,10 +179,15 @@ for (const mode of profiles) {
               best: before.pv[0], wdl: played.wdl, category, depth, critical, explanation, motif }))
           return { ...window.bench, metrics, plies, engine: game.reviews.find(item => item.before.engine)?.before.engine }
         }, name)
-        const result = { mode, name, tailPlies, seconds, requestedWorkers, cores,
+        const { lag, ...measurements } = data
+        lag.sort((a, b) => a - b)
+        const final = resources(profile)
+        const result = { mode, name, tailPlies, seconds, requestedWorkers, cores, mobile, memoryGiB, energy,
+          cpuSeconds: (final.cpu - idle.cpu) / cpuHz, activeRatio: data.activeMs / (seconds * 1000),
+          lagP95Ms: lag[Math.floor(lag.length * .95)], lagMaxMs: lag.at(-1),
           previewSeconds: data.phases.preview === undefined ? undefined : data.phases.preview / 1000,
           criticalSeconds: data.phases.final === undefined || data.phases.critical === undefined ? undefined : (data.phases.final - data.phases.critical) / 1000,
-          nps: Math.round(data.nodes / seconds), idlePssKiB: idlePss, peakPssKiB: peakPss, ...data }
+          nps: Math.round(data.nodes / seconds), idlePssKiB: idle.pss, peakPssKiB: Math.max(peakPss, final.pss), ...measurements }
         appendFileSync(output, JSON.stringify(result) + '\n')
         console.log(mode, name, seconds.toFixed(1) + 's', 'preview=' + result.previewSeconds?.toFixed(2), 'workers=' + data.peakWorkers, data.searches + ' searches', data.nodes + ' nodes')
       } finally { clearInterval(sample) }

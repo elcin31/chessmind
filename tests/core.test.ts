@@ -5,11 +5,28 @@ import { Chess } from 'chess.js'
 import { drawState, positionKey } from '../src/rules'
 import { assess, expectation, sacrifice, summarize, winProbability, type Line } from '../src/review'
 import { analysisKey, db, gameMoves, importAccount, importPgn, parsePgn } from '../src/library'
+import { searchParameters } from '../src/stockfish'
 import { inspectDraft } from '../src/progressive'
 import { annotatedPgn, readClocks } from '../src/pgn'
 import { immortal, opera } from './fixtures'
 
 const line = (value: number, move: string, wdl?: Line['wdl']): Line => ({ kind: 'cp', value, pv: [move], depth: 16, stable: true, wdl })
+
+test('энергопрофили сохраняют шахматный бюджет, Mobile Lite ограничен одним вариантом', () => {
+  const fen = new Chess().fen()
+  const position = { initial: fen, fen, moves: [], legal: 20 }
+  for (const mode of ['quick', 'standard', 'deep', 'professional'] as const) {
+    for (const critical of [false, true]) {
+      const baseline = searchParameters(position, mode, { multiplier: 2 }, critical)
+      assert.deepEqual(searchParameters(position, mode, { energy: 'eco', multiplier: 2 }, critical), baseline)
+      assert.deepEqual(searchParameters(position, mode, { energy: 'turbo', multiplier: 2 }, critical), baseline)
+    }
+  }
+  const regular = searchParameters(position, 'lite', {}, false)
+  const critical = searchParameters(position, 'lite', {}, true)
+  assert.deepEqual([regular.depth, regular.nodes, regular.count], [9, 22_000, 1])
+  assert.deepEqual([critical.depth, critical.nodes, critical.count], [10, 29_700, 1])
+})
 
 test('WDL, ожидание, мат и симметрия цвета', () => {
   const score = line(105, 'e2e4', [550, 400, 50])

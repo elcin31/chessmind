@@ -4,6 +4,7 @@ import type { EngineOptions, Mode } from './game.js'
 import type { Line } from './review.js'
 
 export const budgets = {
+  lite: { label: 'Mobile Lite', depth: 9, extra: 1, lines: 1, nodes: 22_000 },
   quick: { label: 'Express', depth: 10, extra: 3, lines: 2, nodes: 45_000 },
   standard: { label: 'Standard', depth: 15, extra: 4, lines: 3, nodes: 220_000 },
   deep: { label: 'Deep', depth: 19, extra: 5, lines: 3, nodes: 950_000 },
@@ -25,7 +26,7 @@ export function searchParameters(position: Position, mode: Mode, options: Engine
   const depth = targetDepth ?? budget.depth + (critical ? budget.extra : 0)
   const multiplier = mode === 'professional' ? Math.max(0.5, Math.min(3, options.multiplier ?? 1)) : 1
   const count = typeof only === 'string' ? 1 : Math.min(legal, only?.length ?? maxLines ?? budget.lines)
-  const nodesPerSearch = Math.round(budget.nodes * (critical ? 3 : 1) * multiplier)
+  const nodesPerSearch = Math.round(budget.nodes * (critical ? mode === 'lite' ? 1.35 : 3 : 1) * multiplier)
   const nodes = targetNodes ?? nodesPerSearch * (only && typeof only !== 'string' ? count : 1)
   const history = position.initial + (position.moves.length ? ' moves ' + position.moves.join(' ') : '')
   return { choices, count, nodes, depth, history, turn }
@@ -51,6 +52,12 @@ export function collectLines(count: number, turn: number, engine: string) {
         pv: match[6].trim().split(/\s+/), depth: actualDepth, wdl })
       iterations.set(actualDepth, group)
       return work && { depth: actualDepth, nps: Number(work[2]), engine }
+    },
+    get nodes() { return totalNodes },
+    partial() {
+      const deepest = Math.max(0, ...iterations.keys())
+      const line = iterations.get(deepest)?.get(1)
+      return line && { ...line, engine, nodes: totalNodes }
     },
     results() {
       let deepest = 0

@@ -1,9 +1,11 @@
+import { budgets } from './stockfish'
+import type { Mode } from './game'
 import { useSyncExternalStore } from 'react'
 import { stageLabels, type Draft, type StageProgress } from './progressive'
 import type { ComputeEngine } from './cloudProtocol'
 import type { PoolStatus } from './searchPool'
 
-type Progress = StageProgress & { id: string; eta?: number; search?: PoolStatus; automatic: boolean; compute: ComputeEngine }
+type Progress = StageProgress & { id: string; eta?: number; search?: PoolStatus; automatic: boolean; compute: ComputeEngine; mode: Mode }
 let progress: Progress | undefined
 const listeners = new Set<() => void>()
 function subscribe(callback: () => void) {
@@ -43,14 +45,16 @@ export function AnalysisProgress({ id, initial, checked, total, running, queued 
   const done = prepared + (live?.automatic ? 0 : finalCount)
   const rate = Math.floor(done * 100 / max)
   return <div className="analysis-progress" data-stage={live?.stage} data-instant={prepared} data-checked={finalCount}
-    data-critical-done={live?.criticalDone} data-workers={live?.search?.workers} data-threads={live?.search?.threads}>
+    data-critical-done={live?.criticalDone} data-paused={live?.search?.paused} data-workers={live?.search?.workers} data-threads={live?.search?.threads}>
     <div className="progress-label">
-      <strong>{live ? stageLabels[live.stage] : queued ? 'В очереди' : 'Приостановлено'}</strong>
+      <strong>{live ? live.search?.paused ? 'Временная пауза' : stageLabels[live.stage] : queued ? 'В очереди' : 'Приостановлено'}</strong>
       <progress aria-label="Ходы, проанализированные Stockfish" max={max} value={done} />
       <span>{rate}%</span>
     </div>
     <div className="analysis-counts">
       {live && <span>{live.compute === 'cloud' ? 'Облачный анализ' : 'На устройстве'}</span>}
+      {live && !live.automatic && <span>{budgets[live.mode].label}</span>}
+      {live?.search?.energy && <span>{{ eco: 'Eco', balanced: 'Balanced', turbo: 'Turbo' }[live.search.energy]}</span>}
       <span>Позиции {prepared}/{total + 1}</span>
       {live && live.critical > 0 && <span>Критические {live.criticalDone}/{live.critical}</span>}
       {!live?.automatic && <span>Проверено ходов {finalCount}/{total}</span>}

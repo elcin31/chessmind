@@ -1,3 +1,4 @@
+import { withAnalysisLock } from './analysisQueue'
 import { Chess, type Move, type Square } from 'chess.js'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronRight, Lightbulb, Play, RotateCcw, Target } from 'lucide-react'
@@ -138,12 +139,13 @@ function TaskView({ task, onPractice, next, canNext, multi }: {
     const current = new AbortController()
     controller.current = current
     setPending(true)
-    const engine = new Engine(current.signal, game.options, undefined, game.id)
+    const mode = game.mode ?? 'standard'
+    const options = mode === 'lite' ? { ...game.options, full: false, hash: 16 as const, threads: 1 as const } : game.options
+    const engine = new Engine(current.signal, options, undefined, game.id)
     try {
       const candidate = new Chess(fen).move({ from, to, promotion })
       const notation = uci(candidate)
       const position = { initial: game.initial, moves: [...task.moves.slice(0, review.index).map(uci), ...path.map(uci)], fen }
-      const mode = game.mode ?? 'standard'
       const known = !path.length ? review.lines.find(line => line.pv[0] === notation) ?? (review.played.pv[0] === notation ? review.played : undefined) : undefined
       let recommended = path.length ? undefined : review.before
       let evaluated = known
@@ -157,8 +159,7 @@ function TaskView({ task, onPractice, next, canNext, multi }: {
             recommended = (await engine.evaluate(position, mode, review.critical, recommended.pv[0], evaluated.depth))[0]
           }
         }
-        if (navigator.locks) await navigator.locks.request('chessmind-queue', { signal: current.signal }, check)
-        else await check()
+        await withAnalysisLock(current, check)
       }
       if (current.signal.aborted) return
       const correct = sameMove || !!evaluated && !!recommended && sameStrength(evaluated, recommended)

@@ -168,6 +168,7 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
   const notation = uci(move)
   const current = positions[index], child = positions[index + 1]
   const terminal = drawState(new Chess(move.after), child.repetitions, child.legal)
+  const lite = mode === 'lite'
   let root = historyRoot ?? { lines: await engine.evaluate(current, mode, force), deep: force }
   async function compare() {
     const best = root.lines[0]
@@ -175,6 +176,7 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
     if (inMulti || !best.pv.length) return { best, played: inMulti ?? best }
     const search = async (move: string, depth: number) => (await engine.evaluate(current, mode, root.deep, move, depth))[0]
     const played = await search(notation, best.depth)
+    if (lite) return { best, played }
     const sameKind = played.kind === best.kind
     const mateAgrees = sameKind && best.kind === 'mate' && Math.sign(played.value) === Math.sign(best.value)
     if (!force && played.depth === best.depth && (sameKind && best.kind === 'cp' || mateAgrees)) return { best, played }
@@ -203,7 +205,8 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
       expectation(pair.played, move.color, !!pair.played.wdl && !!childLine.wdl) -
       expectation(childLine, move.color, !!pair.played.wdl && !!childLine.wdl) >= 10)
   const critical = force || !preliminary.forced && !!root.lines[0].pv.length &&
-    (prioritized || expressDisagreement || preliminary.loss >= 7 || preliminary.gap >= 14 || preliminary.lostMate || preliminary.allowsMate || sacrifice(move, baseChild.lines[0]))
+    (lite ? prioritized : prioritized || expressDisagreement || preliminary.loss >= 7 || preliminary.gap >= 14 ||
+      preliminary.lostMate || preliminary.allowsMate || sacrifice(move, baseChild.lines[0]))
   if (critical && !root.deep) {
     root = { lines: await engine.evaluate(current, mode, true), deep: true }
     pair = await compare()
@@ -211,7 +214,7 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
 
   let next = baseChild
   let after = next.lines[0]
-  if (critical && !force && !move.captured && !preliminary.forced) {
+  if (critical && !lite && !force && !move.captured && !preliminary.forced) {
     const candidate = classify(after, true)
     const canBeBrilliant = candidate.reliable && candidate.loss <= 1 && (candidate.cpLoss === null || candidate.cpLoss <= 12) &&
       candidate.gap >= 5 && expectation(pair.played, move.color) >= 65 &&
@@ -229,7 +232,7 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
     const value = matesWithMove ? played.value - Math.sign(played.value) : played.value
     if (value !== 0 || played.kind !== 'mate') after = { ...played, value, depth: played.depth - 1, pv: played.pv.slice(1) }
   }
-  let result = classify(after, critical)
+  let result = classify(after, critical && !lite)
   if (result.category === 'brilliant' && !next.deep) {
     next = { lines: await engine.evaluate(child, mode, true), deep: true }
     after = next.lines[0]

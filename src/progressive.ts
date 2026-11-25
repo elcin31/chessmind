@@ -15,6 +15,7 @@ export type Draft = {
   format: 1
   instant: Array<Line | null>
   work?: { profile: string; critical: number[]; reviews: Record<number, Review> }
+  interrupted?: { profile: string; index: number; reason: 'time' | 'load'; line?: Line }
 }
 
 export function validDraft(game: Game) {
@@ -120,11 +121,15 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
     format: 1, instant: prior ? [...prior.instant] : positions.map(() => null),
     ...(oldWork ? { work: { ...oldWork, reviews: { ...oldWork.reviews } } } : {}),
   }
-  const options = game.options ?? {}
+  const options: EngineOptions = !previewOnly && mode === 'lite'
+    ? { ...game.options, full: false, threads: 1, workers: 1, hash: 16 }
+    : game.options ?? {}
+  const retry = prior?.interrupted?.profile === profile ? prior.interrupted : undefined
+  draft.interrupted = retry
   const previewOptions = { ...options, full: false }
   const makePool = createPool ?? (async (config: EngineOptions) => {
     const { SearchPool, poolConfiguration } = await import('./searchPool.js')
-    return new SearchPool(signal, game.id, config, await poolConfiguration(config), telemetry)
+    return new SearchPool(signal, game.id, config, await poolConfiguration(config), telemetry, retry?.reason === 'time' ? retry.index : undefined)
   })
   let pool = await makePool(previewOptions)
   let instant = draft.instant.filter(Boolean).length
@@ -134,6 +139,7 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
     stage, instant, checked, critical: draft.work?.critical.length ?? 0, criticalDone, moves: moves.length,
   })
 
+  let currentStage: Stage = 'instant'
   try {
     await publish('instant')
     await runStage(pool, positions.map((_, index) => index).filter(index => !draft.instant[index]), signal, async index => {
@@ -152,8 +158,9 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
       pool = await makePool(options)
     }
     if (!draft.work) {
+      const candidates = criticalPositions(game, draft, moves)
       draft.work = {
-        profile, critical: criticalPositions(game, draft, moves),
+        profile, critical: mode === 'lite' ? candidates.slice(0, Math.min(6, Math.ceil(moves.length / 10))) : candidates,
         reviews: Object.fromEntries((game.reviews ?? []).map(review => [review.index, review])),
       }
       checked = Object.keys(draft.work.reviews).length
@@ -164,7 +171,7 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
       // The original comparison, mate and sacrifice checks remain in analyzeMove.
       // Priority also rechecks a preview with serious, contradictory evidence.
       const preview = inspectDraft(game, draft, index, moves)
-      const prioritize = stage === 'critical' && !!preview && (preview.loss >= 23 || preview.before.kind !== preview.after.kind)
+      const prioritize = stage === 'critical' && !!preview && (mode === 'lite' || preview.loss >= 23 || preview.before.kind !== preview.after.kind)
       const { review } = await analyzeMove(game, mode, pool.at(index), index, moves, positions, undefined, false, prioritize)
       work.reviews[index] = review
       checked++
@@ -172,12 +179,23 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
       await publish(stage)
     }
 
-    await publish('critical')
+    currentStage = 'critical'
+    await publish(currentStage)
     await runStage(pool, work.critical.filter(index => !work.reviews[index]), signal, index => verify(index, 'critical'))
-    await publish('final')
+    currentStage = 'final'
+    await publish(currentStage)
     await runStage(pool, moves.map((_, index) => index).filter(index => !work.reviews[index]), signal, index => verify(index, 'final'))
     const reviews = moves.map((_, index) => work.reviews[index])
     // The completed pass lives in Game.reviews, separate from the Instant cache.
-    return { draft: { ...draft, work: undefined }, reviews }
+    return { draft: { ...draft, work: undefined, interrupted: undefined }, reviews }
+  } catch (error) {
+    if (!createPool && !signal.aborted) {
+      const { PositionInterrupted } = await import('./searchPool.js')
+      if (error instanceof PositionInterrupted) {
+        draft.interrupted = { profile, index: error.index, reason: error.reason, line: error.line }
+        await publish(currentStage)
+      }
+    }
+    throw error
   } finally { await pool.close() }
 }

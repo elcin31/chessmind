@@ -23,28 +23,30 @@ export function getCloudStatus(force = false): Promise<CloudStatus> {
   return currentStatus
 }
 
-export function useCloudStatus(visible: boolean) {
+export function useCloudStatus(visible: boolean, poll = true) {
   const [status, setStatus] = useState<CloudStatus>()
   useEffect(() => {
     if (!visible) return
     let mounted = true
-    const check = () => { void getCloudStatus(true).then(value => { if (mounted) setStatus(value) }) }
+    const check = (event?: Event) => {
+      void getCloudStatus(poll || !!event).then(value => { if (mounted) setStatus(value) })
+    }
     check()
     window.addEventListener('online', check)
     window.addEventListener('offline', check)
-    const timer = setInterval(check, 30_000)
+    const timer = poll ? setInterval(check, 30_000) : undefined
     return () => {
       mounted = false
       clearInterval(timer)
       window.removeEventListener('online', check)
       window.removeEventListener('offline', check)
     }
-  }, [visible])
+  }, [visible, poll])
   return status
 }
 
 export function cloudBlocker(game: Game | undefined, mode: Mode, status: CloudStatus | undefined) {
-  if (!supportedCloudMode(mode)) return 'Deep и Professional выполняются на устройстве.'
+  if (!supportedCloudMode(mode)) return mode === 'lite' ? 'Mobile Lite выполняется на устройстве.' : 'Deep и Professional выполняются на устройстве.'
   if (game && !referenceFor(game)) return 'Для облака нужна партия из официального архива Chess.com или Lichess.'
   if (game && game.moves > cloudLimits.plies[mode]) return 'Облачный лимит для этого режима — ' + cloudLimits.plies[mode] + ' полуходов.'
   if (!status) return 'Проверяем доступность облака…'

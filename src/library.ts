@@ -7,7 +7,7 @@ export * from './game.js'
 export type Practice = { id: string; correct: number; wrong: number; streak: number; due: number; last: number }
 interface Store extends DBSchema {
   games: { key: string; value: Game; indexes: { url: string } }
-  positions: { key: string; value: Line[] | { lines: Line[]; used: number }; indexes: { used: number } }
+  positions: { key: string; value: Line[] | { lines: Line[]; used: number; hits?: number }; indexes: { used: number } }
   archives: { key: string; value: true }
   practice: { key: string; value: Practice }
 }
