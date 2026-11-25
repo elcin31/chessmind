@@ -33,7 +33,8 @@ function memory(profile) {
 const { appendFileSync } = await import('node:fs')
 const profiles = (process.env.BENCH_MODES ?? 'quick,standard,deep,professional').split(',')
 const tailPlies = Number(process.env.BENCH_TAIL ?? 0)
-const rawGames = process.env.BENCH_GAMES === 'opera' ? [[opera, 'Morphy']] : [[opera, 'Morphy'], [immortal, 'Anderssen']]
+const rawGames = [[opera, 'Morphy', 'opera'], [immortal, 'Anderssen', 'immortal']]
+  .filter(([, , name]) => !process.env.BENCH_GAMES || process.env.BENCH_GAMES === name)
 const games = rawGames.map(([pgn, name]) => {
   if (!tailPlies) return [pgn, name]
   const game = new Chess()
@@ -46,6 +47,8 @@ const games = rawGames.map(([pgn, name]) => {
   return [tags + '\n\n' + body + ' ' + headers.Result, name]
 })
 const threads = process.env.BENCH_THREADS === 'auto' ? undefined : 1
+const requestedWorkers = Number(process.env.BENCH_WORKERS) || undefined
+const cores = Number(process.env.BENCH_CORES) || undefined
 for (const mode of profiles) {
   const profile = mkdtempSync(join(tmpdir(), 'chessbench-'))
   const context = await chromium.launchPersistentContext(profile, {
@@ -53,11 +56,23 @@ for (const mode of profiles) {
     viewport: { width: 402, height: 874 },
   })
   try {
-    await context.addInitScript(({ threads }) => {
-      localStorage.setItem('chessmind-settings', JSON.stringify({ theme: 'system', nickname: '', engine: { threads, hash: 16 } }))
+    await context.addInitScript(({ threads, requestedWorkers, cores }) => {
+      if (cores) Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => cores })
+      localStorage.setItem('chessmind-settings', JSON.stringify({ theme: 'system', nickname: '', engine: { threads, hash: 16, workers: requestedWorkers } }))
       const original = Worker.prototype.postMessage
       const observed = new WeakMap()
-      window.bench = { searches: 0, nodes: 0, depths: 0 }
+      window.bench = { searches: 0, nodes: 0, depths: 0, peakWorkers: 0, peakThreads: 0, phases: {} }
+      const running = new Set()
+      const observer = new MutationObserver(() => {
+        if (!window.bench.start) return
+        const node = document.querySelector('.analysis-progress')
+        const phase = node?.dataset.stage
+        const elapsed = performance.now() - window.bench.start
+        if (phase) window.bench.phases[phase] ??= elapsed
+        if (document.querySelector('[data-preview-ready]')) window.bench.phases.preview ??= elapsed
+        window.bench.peakThreads = Math.max(window.bench.peakThreads, Number(node?.dataset.threads ?? 0))
+      })
+      observer.observe(document, { attributes: true, childList: true, subtree: true })
       Worker.prototype.postMessage = function (message, ...options) {
         if (typeof message === 'string' && message.startsWith('go ')) {
           let search = observed.get(this)
@@ -72,6 +87,7 @@ for (const mode of profiles) {
                 if (nodes) search.nodes = Math.max(search.nodes, Number(nodes))
                 if (depth) search.depth = Math.max(search.depth, Number(depth))
                 if (line.startsWith('bestmove')) {
+                  running.delete(this)
                   window.bench.nodes += search.nodes
                   window.bench.depths += search.depth
                 }
@@ -80,10 +96,12 @@ for (const mode of profiles) {
           }
           search.nodes = search.depth = 0
           window.bench.searches++
+          running.add(this)
+          window.bench.peakWorkers = Math.max(running.size, window.bench.peakWorkers)
         }
         return original.call(this, message, ...options)
       }
-    }, { threads })
+    }, { threads, requestedWorkers, cores })
     const page = context.pages()[0]
     await page.goto(url)
     await page.getByText('Офлайн готов').waitFor({ timeout: 30_000 })
@@ -93,7 +111,9 @@ for (const mode of profiles) {
     for (const [, name] of games) {
       await page.locator('.recent-list button').filter({ hasText: name }).click()
       await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption(mode)
-      await page.evaluate(() => Object.assign(window.bench, { searches: 0, nodes: 0, depths: 0 }))
+      await page.evaluate(() => Object.assign(window.bench, {
+        searches: 0, nodes: 0, depths: 0, peakWorkers: 0, peakThreads: 0, phases: {}, start: performance.now(),
+      }))
       const idlePss = memory(profile)
       let peakPss = idlePss
       const sample = setInterval(() => { peakPss = Math.max(peakPss, memory(profile)) }, 1500)
@@ -119,15 +139,19 @@ for (const mode of profiles) {
             const accuracy = reviews.map(item => item.accuracy)
             const harmonic = accuracy.includes(0) ? 0 : 1 / mean(accuracy.map(value => 1 / value))
             return { color, accuracy: (harmonic + mean(accuracy)) / 2,
-              acpl: mean(reviews.flatMap(item => item.cpLoss === null ? [] : [item.cpLoss])) }
+              acpl: mean(reviews.flatMap(item => item.cpLoss === null ? [] : [item.cpLoss])), esl: mean(reviews.map(item => item.loss)) }
           })
-          const plies = game.reviews.map(({ before, played, after, category, depth, critical }) =>
-            ({ before: [before.kind, before.value], played: [played.kind, played.value], after: [after.kind, after.value], category, depth, critical }))
+          const plies = game.reviews.map(({ before, played, after, category, depth, critical, explanation, motif }) =>
+            ({ before: [before.kind, before.value], played: [played.kind, played.value], after: [after.kind, after.value],
+              best: before.pv[0], wdl: played.wdl, category, depth, critical, explanation, motif }))
           return { ...window.bench, metrics, plies, engine: game.reviews.find(item => item.before.engine)?.before.engine }
         }, name)
-        const result = { mode, name, tailPlies, seconds, idlePssKiB: idlePss, peakPssKiB: peakPss, ...data }
+        const result = { mode, name, tailPlies, seconds, requestedWorkers, cores,
+          previewSeconds: data.phases.preview === undefined ? undefined : data.phases.preview / 1000,
+          criticalSeconds: data.phases.final === undefined || data.phases.critical === undefined ? undefined : (data.phases.final - data.phases.critical) / 1000,
+          nps: Math.round(data.nodes / seconds), idlePssKiB: idlePss, peakPssKiB: peakPss, ...data }
         appendFileSync(output, JSON.stringify(result) + '\n')
-        console.log(mode, name, seconds.toFixed(1) + 's', data.searches + ' searches', data.nodes + ' nodes')
+        console.log(mode, name, seconds.toFixed(1) + 's', 'preview=' + result.previewSeconds?.toFixed(2), 'workers=' + data.peakWorkers, data.searches + ' searches', data.nodes + ' nodes')
       } finally { clearInterval(sample) }
       await page.goto(url + '/#home')
     }

@@ -2,6 +2,8 @@ import { Chess, DEFAULT_POSITION, type Color, type Move, type Square } from 'che
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeftRight, ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Cpu, Flag, Pause, Play, RotateCcw, ScanLine, Target } from 'lucide-react'
 import { AnalysisProgress, useLiveReview } from './AnalysisProgress'
+import { inspectDraft, validDraft } from './progressive'
+import { focusAnalysis } from './searchPool'
 import { PlayerBadge } from './PlayerCard'
 import { profileSource } from './playerProfiles'
 import { Board } from './Board'
@@ -46,13 +48,23 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   useEffect(() => () => controller.current?.abort(), [])
   const clocks = useMemo(() => game && /%clk|%emt/.test(game.pgn) ? readClocks(game.pgn, moves, game.time) : [], [game?.pgn, moves, game?.time])
   const live = useLiveReview(base?.id)
-  const reviews = saved ? saved.reviews : live && live.length > (base?.reviews?.length ?? 0) ? live : base?.reviews ?? []
+  const draft = !saved && base ? live ?? validDraft(base) : undefined
+  const finished = !!game && isComplete(game)
+  const byIndex = useMemo(() => !game ? [] : moves.map((_, i) =>
+    game.reviews?.[i] ?? (!finished && draft ? inspectDraft(game, draft, i, moves) : undefined)),
+  [game?.id, game?.reviews, game?.mode, game?.options, draft, moves, finished])
+  const reviews = useMemo(() => byIndex.filter((item): item is Review => !!item), [byIndex])
+  useEffect(() => {
+    if (!base?.id || saved || index === 0) return
+    focusAnalysis(base.id, Math.max(0, index - 1))
+    return () => focusAnalysis(base.id)
+  }, [base?.id, index, saved])
   const last = moves[index - 1]
   const verified = !saved ? checked[index - 1] : undefined
-  const review = verified ?? reviews[index - 1]
+  const review = verified ?? byIndex[index - 1]
   const position = branches.at(-1)?.after ?? last?.after ?? game?.initial ?? DEFAULT_POSITION
-  const completed = game && isComplete(game)
-  const arrow = reviews[index]?.before.pv[0] ?? review?.after.pv[0]
+  const completed = finished
+  const arrow = byIndex[index]?.before.pv[0] ?? draft?.instant[index]?.pv[0] ?? review?.after.pv[0]
   const arrows = useMemo(() => arrow && !branches.length ? [arrow] : [], [arrow, branches.length])
   const materialBalance = useMemo(() => material(new Chess(position), 'w'), [position])
   const swipe = useCallback((direction: -1 | 1) => {
@@ -95,6 +107,12 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   const nextError = landmarks.find(item => item.index + 1 > index && errors.includes(item.category))
   const nextGuided = landmarks.find(item => item.index + 1 > index)
   const white = summarize(reviews, 'w'), black = summarize(reviews, 'b')
+  const ready = reviews.at(-1)
+  const instantCount = draft?.instant.filter(Boolean).length ?? 0
+  const chart = Array.from({ length: moves.length + 1 }, (_, ply) => {
+    const line = (ply ? byIndex[ply - 1]?.after : byIndex[0]?.before) ?? draft?.instant[ply]
+    return line ? [{ line, ply }] : []
+  }).flat()
   const clock = clocks[index - 1]
   const pressureErrors = rankedErrors.filter(item => {
     const remaining = clocks[item.index]?.remaining
@@ -118,7 +136,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   }
   function download() {
     if (!game) return
-    const url = URL.createObjectURL(new Blob([annotatedPgn({ ...game, reviews })], { type: 'application/x-chess-pgn;charset=utf-8' }))
+    const url = URL.createObjectURL(new Blob([annotatedPgn(game, byIndex.map(item => item?.preliminary ? undefined : item))], { type: 'application/x-chess-pgn;charset=utf-8' }))
     const link = document.createElement('a')
     link.href = url
     link.download = 'chessmind-' + game.id.slice(0, 8) + '.pgn'
@@ -152,23 +170,31 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
             {item.methodology ?? 1}.0 · {budgets[item.mode].label} · {item.reviews.length} ходов · {item.options?.full ? 'Full' : 'Lite'} · {item.options?.multiplier ?? 1}×
           </option>)}
         </select> : null}
-        <select aria-label="Глубина анализа" value={speed} onChange={event => setSpeed(event.target.value as Mode)} disabled={game.queued || !!saved || checking !== undefined}>
+        <select aria-label="Глубина анализа" value={speed} onChange={event => setSpeed(event.target.value as Mode)} disabled={!!saved || checking !== undefined}>
           {Object.entries(budgets).map(([key, settings]) => <option key={key} value={key}>{settings.label}</option>)}
         </select>
-        {game.queued ? <button onClick={() => onPause(game)}><Pause size={16} /> Пауза</button> :
-          <button className="primary" disabled={!!saved || checking !== undefined || !!completed && sameProfile} onClick={() => onQueue(game, speed)}><Cpu size={17} />{completed && sameProfile ? 'Анализ готов' : reviews.length && sameProfile ? 'Продолжить' : 'Начать анализ'}</button>}
-        {reviews.length > 0 && <button onClick={download}>PGN с разбором</button>}
+        {!saved && (game.queued || active === game.id) && <button onClick={() => onPause(game)}><Pause size={16} /> Пауза</button>}
+        {game.queued && !saved && game.mode !== speed && <button className="primary" onClick={() => onQueue(game, speed)}>Сменить режим</button>}
+        {!game.queued &&
+          <button className="primary" disabled={!!saved || checking !== undefined || !!completed && sameProfile} onClick={() => onQueue(game, speed)}><Cpu size={17} />{completed && sameProfile ? 'Анализ готов' : (reviews.length || instantCount) && sameProfile ? 'Продолжить' : 'Начать анализ'}</button>}
+        {reviews.some(item => !item.preliminary) && <button onClick={download}>PGN с разбором</button>}
       </div>
-      {!saved && (game.queued || reviews.length > 0 && !completed) && <>
-        <AnalysisProgress id={game.id} done={reviews.length} total={moves.length} running={active === game.id && !!game.queued} queued={!!game.queued} />
-        {reviews.length > index && <button className="jump-analyzed" onClick={() => navigate(reviews.length)}>К последнему готовому ходу</button>}
-      </> }
+      {!saved && !completed && (game.queued || active === game.id || reviews.some(item => !item.preliminary) || !!instantCount && instantCount < moves.length + 1) && <>
+        <AnalysisProgress id={game.id} initial={instantCount} checked={reviews.filter(item => !item.preliminary).length} total={moves.length}
+          running={active === game.id} queued={!!game.queued} />
+      </>}
+      {!completed && ready && ready.index + 1 > index && <button className="jump-analyzed" onClick={() => navigate(ready.index + 1)}>К последнему готовому ходу</button>}
+      {!saved && !completed && instantCount === moves.length + 1 && <div className="preview-summary" data-preview-ready>
+        <strong>Предварительная точность</strong><span>Белые {percent(white.accuracy)}</span><span>Чёрные {percent(black.accuracy)}</span>
+        {rankedErrors.length > 0 && <button onClick={() => navigate(rankedErrors[0].index + 1)}>К переломному моменту</button>}
+      </div>}
+      {completed && <p className="analysis-finished">Анализ завершён</p>}
     </section>
     <div className="review-layout">
       <section className="board-column">
         <div className="player-line">{player(orientation === 'b' ? 'w' : 'b')}</div>
         <div className="evaluation-layout">
-          <div className="eval-bar" aria-label="Преимущество"><div style={{ height: expectation(review?.after ?? reviews[0]?.before ?? { kind: 'cp', value: 0, depth: 0, pv: [] }, orientation) + '%' }} /><span>{evalLabel(review?.after ?? reviews[0]?.before)}</span></div>
+          <div className="eval-bar" aria-label="Преимущество"><div style={{ height: expectation(review?.after ?? draft?.instant[index] ?? byIndex[0]?.before ?? { kind: 'cp', value: 0, depth: 0, pv: [] }, orientation) + '%' }} /><span>{evalLabel(review?.after ?? draft?.instant[index] ?? byIndex[0]?.before)}</span></div>
           <Board fen={position} orientation={orientation} last={branches.at(-1) ?? last}
             accent={review && errors.includes(review.category) && !branches.length ? categories[review.category][2] : undefined}
             arrows={arrows} onMove={tryMove} onSwipe={swipe} />
@@ -183,21 +209,23 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
         {branches.length > 0 && <div className="branch"><strong>Вариант</strong> {branches.map(move => move.san).join(' ')}
           <div><button onClick={() => setBranches(branches.slice(0, -1))}><ChevronLeft size={16} /> Ход назад</button>
             <button onClick={() => setBranches([])}><RotateCcw size={16} /> К партии</button></div></div>}
-        {reviews.length > 0 && <section className="panel graph-panel"><div className="list-heading"><h3>График партии</h3>
+        {chart.length > 0 && <section className="panel graph-panel"><div className="list-heading"><h3>График партии{!completed && draft ? ' · предварительный' : ''}</h3>
           <select aria-label="Величина на графике" value={graph} onChange={event => setGraph(event.target.value as 'points' | 'cp')}>
             <option value="points">Ожидаемые очки</option><option value="cp">Оценка в пешках</option>
           </select></div>
-          <Chart center={graph === 'points' ? 50 : undefined} values={[reviews[0].before, ...reviews.map(move => move.after)].map(line =>
+          <Chart center={graph === 'points' ? 50 : undefined} values={chart.map(({ line }) =>
             graph === 'points' ? expectation(line) : line.kind === 'mate' ? Math.sign(line.value) * 12 : Math.max(-12, Math.min(12, line.value / 100)))}
-            labels={['Старт', ...reviews.map(item => moves[item.index].san + ' · ' + evalLabel(item.after))]} selected={index}
-            onSelect={navigate} caption={graph === 'points' ? 'Ожидаемый результат белых' : 'Оценка белых · шкала ±12, мат на границе'} /></section>}
+            labels={chart.map(({ ply, line }) => (ply ? moves[ply - 1].san : 'Старт') + ' · ' + evalLabel(line))}
+            selected={chart.some(item => item.ply === index) ? chart.findIndex(item => item.ply === index) : undefined}
+            onSelect={point => navigate(chart[point].ply)} caption={graph === 'points' ? 'Ожидаемый результат белых' : 'Оценка белых · шкала ±12, мат на границе'} /></section>}
 
       </section>
       <div className="review-details">
         <section className="panel coach-card">
           <div className="card-head"><div className="section-icon"><Target size={20} /></div><div><h3>Тренер</h3><p>Разбор позиции</p></div></div>
           {review ? <>
-            <div className="move-heading"><Marker category={review.category} /><strong>{last?.san} · {categories[review.category][0]}</strong>
+            <div className="move-heading">{review.preliminary ? <span className="marker">≈</span> : <Marker category={review.category} />}
+              <strong>{last?.san} · {review.preliminary ? errors.includes(review.category) ? 'Возможная ошибка' : 'Предварительная оценка' : categories[review.category][0]}</strong>
               <span>{review.depth > 0 ? 'Глубина ' + review.depth : 'Терминальная позиция'}</span></div>
             <p>{review.explanation}</p>
             {coachingPrinciple(review.motif) && <p className="muted">{coachingPrinciple(review.motif)}</p>}
@@ -211,7 +239,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
               {[['Победа', review.color === 'w' ? 0 : 2], ['Ничья', 1], ['Поражение', review.color === 'w' ? 2 : 0]].map(([label, i]) =>
                 <div key={label}><span>{label}</span><strong>{percent(review.played.wdl![Number(i)] / 10)}</strong></div>)}
             </div>}
-            <div className="metric-strip"><div><small>Лучший / сыгранный</small><b>{evalLabel(review.before)} / {evalLabel(review.played)}</b></div>
+            <div className="metric-strip"><div><small>{review.preliminary ? 'До и после хода' : 'Лучший / сыгранный'}</small><b>{evalLabel(review.before)} / {evalLabel(review.preliminary ? review.after : review.played)}</b></div>
               <div><small>Потеря ожидания</small><b>{number(review.loss)} п. п.</b></div>
               <div><small>Ожидание игрока</small><b>{percent(expectation(review.before, review.color, !!review.before.wdl && !!review.played.wdl))} → {percent(expectation(review.played, review.color, !!review.before.wdl && !!review.played.wdl))}</b></div></div>
             <div className="action-row">{checking !== undefined ? <button onClick={() => controller.current?.abort()}>Остановить перепроверку</button> :
@@ -222,7 +250,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
           {reviews.length > 0 && <div className="action-row"><button disabled={!nextError} onClick={() => nextError && navigate(nextError.index + 1)}><Flag size={16} /> К ошибке</button>
             <button disabled={!nextGuided && guided} onClick={() => { guide(true); const next = guided ? nextGuided : landmarks[0] ?? reviews[0]; if (next) navigate(next.index + 1) }}>
               {guided ? 'Следующий момент' : 'Пошаговый разбор'}</button></div>}
-          {review && <div className="variations"><h4>Сравнение вариантов</h4>{(review.lines.some(line => line.pv[0] === review.played.pv[0]) ? review.lines : [...review.lines, review.played]).filter(line => line.pv.length > 0).map((line, idx) => {
+          {review && <div className="variations"><h4>{review.preliminary ? 'Предварительное продолжение' : 'Сравнение вариантов'}</h4>{(review.preliminary || review.lines.some(line => line.pv[0] === review.played.pv[0]) ? review.lines : [...review.lines, review.played]).filter(line => line.pv.length > 0).map((line, idx) => {
             const steps = variation(last!.before, line.pv)
             return <div className="pv" key={line.pv[0]}><button onClick={() => branch(last!.before, line.pv)}><strong>{evalLabel(line)}</strong><span>{steps.slice(0, 8).map(step => step.san).join(' ')}</span>{(idx === 0 || line.pv[0] === review.played.pv[0]) && <small>{idx === 0 ? 'Лучший' : 'Сыгранный'}{idx === 0 && line.pv[0] === review.played.pv[0] ? ' · сыгранный' : ''}</small>}</button>
               {branches[0]?.before === last!.before && branches[0]?.lan === steps[0]?.lan && <div className="pv-steps">{steps.map((step, i) => <button key={i} onClick={() => setBranches(steps.slice(0, i + 1))}>{step.san}</button>)}</div>}</div>
@@ -231,7 +259,8 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
         <section className="panel move-panel"><div className="list-heading"><h3>Ходы партии <span>{moves.length}</span></h3>
           <button aria-pressed={compact} onClick={() => setCompact(!compact)}>{compact ? 'Только важные' : 'Все ходы'}</button></div>
           <div className="move-grid">{moves.map((move, i) => (!compact || landmarks.some(item => item.index === i)) && <button key={i} aria-pressed={index === i + 1} onClick={() => navigate(i + 1)}>
-            <span>{move.before.split(' ')[5]}{move.color === 'w' ? '.' : '…'}</span>{move.san}{reviews[i] && <Marker category={reviews[i].category} />}</button>)}</div></section>
+            <span>{move.before.split(' ')[5]}{move.color === 'w' ? '.' : '…'}</span>{move.san}{byIndex[i]?.preliminary ? errors.includes(byIndex[i]!.category) && <span className="marker" title="Возможная ошибка">≈</span> :
+              byIndex[i] && <Marker category={byIndex[i]!.category} />}</button>)}</div></section>
       </div>
     </div>
     {completed && <div className="review-summary">

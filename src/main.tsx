@@ -7,9 +7,11 @@ import { GameCard } from './PlayerCard'
 import { Board } from './Board'
 import { ImportForm } from './Import'
 import { Empty, ReviewScreen } from './ReviewScreen'
-import { budgets, trimCache, type SearchSpeed } from './engine'
+import { budgets, trimCache } from './engine'
 import { analysisKey, db, methodologyVersion, historicalRating, isComplete, parsePgn, playerColor, timeLabel, type Analysis, type EngineOptions, type Game, type Mode, type Practice } from './library'
-import { analyzeGame, categories, type Line, type Review } from './review'
+import { categories, type Line, type Review } from './review'
+import { analyzeProgressively, hasPreview, type Draft, type StageProgress } from './progressive'
+import type { PoolStatus } from './searchPool'
 import './style.css'
 
 const Methodology = lazy(() => import('./Methodology').then(module => ({ default: module.Methodology })))
@@ -30,7 +32,7 @@ const pages = {
   methodology: { label: 'Методология', icon: CircleHelp, title: 'Методология', subtitle: 'Формулы, допущения и источники' },
 }
 type Page = keyof typeof pages
-type Settings = { nickname: string; theme: 'system' | 'light' | 'dark'; mode: Mode; engine?: EngineOptions; board?: 'sage' | 'navy' | 'gold' }
+type Settings = { nickname: string; theme: 'system' | 'light' | 'dark'; mode: Mode; engine?: EngineOptions; autoPreview?: number; board?: 'sage' | 'navy' | 'gold' }
 const core: Page[] = ['home', 'games', 'review', 'training', 'stats']
 const secondary: Page[] = ['openings', 'endgames', 'settings', 'methodology']
 
@@ -63,7 +65,7 @@ function App() {
   const [offline, setOffline] = useState(false)
   const [update, setUpdate] = useState<ServiceWorker>()
   const [visible, setVisible] = useState(!document.hidden)
-  const current = useRef<{ id: string; controller: AbortController } | undefined>(undefined)
+  const current = useRef<{ id: string; controller: AbortController; automatic: boolean } | undefined>(undefined)
   const state = pages[location.page]
   const sorted = useMemo(() => [...games].sort((first, second) => second.date.localeCompare(first.date) || (second.timestamp ?? 0) - (first.timestamp ?? 0)), [games])
   const selected = games.find(game => game.id === location.id) ?? sorted[0]
@@ -113,65 +115,104 @@ function App() {
     if (updated) setGames(previous => previous.map(game => game.id === updated.id ? updated : game))
   }
   useEffect(() => {
+    if (!settings.autoPreview && current.current?.automatic) current.current.controller.abort()
     if (!visible || current.current || active) return
-    const pending = games.filter(game => game.queued).sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0))[0]
+    const manual = games.filter(game => game.queued).sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0))[0]
+    const pending = manual ?? sorted.slice(0, settings.autoPreview || 0)
+      .find(game => !isComplete(game) && !game.autoPreviewPaused && !hasPreview(game))
     if (!pending) return
+    const automatic = !manual
     const controller = new AbortController()
-    current.current = { id: pending.id, controller }
+    current.current = { id: pending.id, controller, automatic }
     setActive(pending.id)
     const run = async () => {
       let latest = await (await db).get('games', pending.id)
-      if (!latest?.queued || controller.signal.aborted) return mergeGame(latest)
-      if (latest.methodology !== 2) latest = await patchGame(latest.id, prepareAnalysis(latest, latest.mode ?? 'standard', settings.engine))
-      if (!latest) return
-      const existing = latest.reviews?.length ?? 0
-      const { id, moves } = latest
-      let staged = latest.reviews ?? []
-      let persisted = existing
-      let lastSave = performance.now(), lastPaint = lastSave, lastPly = lastSave
-      let search: SearchSpeed | undefined
-      let secondsPerPly: number | undefined
-      const publishProgress = () => updateProgress({
-        id, done: staged.length, total: moves, search,
-        eta: staged.length - existing >= 2 && secondsPerPly !== undefined ? Math.ceil(secondsPerPly * (moves - staged.length)) : undefined,
-      })
-      async function checkpoint() {
-        if (staged.length === persisted) return
-        const reviews = [...staged]
-        const complete = reviews.length === moves
-        const updated = await patchGame(id, { reviews, ...(complete ? { queued: false } : {}) })
-        if (complete) mergeGame(updated)
-        persisted = reviews.length
-        lastSave = performance.now()
+      if (!latest || controller.signal.aborted || !automatic && !latest.queued ||
+        automatic && (latest.queued || latest.autoPreviewPaused || hasPreview(latest) || isComplete(latest))) return mergeGame(latest)
+      if (!automatic && latest.methodology !== 2) {
+        latest = await patchGame(latest.id, prepareAnalysis(latest, latest.mode ?? 'standard', settings.engine))
       }
-      publishProgress()
-      try {
-        await analyzeGame(latest, latest.mode ?? 'standard', controller.signal, async reviews => {
-          const now = performance.now()
-          const seconds = (now - lastPly) / 1000
-          secondsPerPly = secondsPerPly === undefined ? seconds : .82 * secondsPerPly + .18 * seconds
-          lastPly = now
-          staged = reviews
-          publishProgress()
-          if (reviews.length === existing + 1 || now - lastPaint >= 300) {
-            updateLiveReview({ id, reviews: [...reviews] })
-            lastPaint = now
-          }
-          if (reviews.length === moves || reviews.length === existing + 1 || now - lastSave >= 900) await checkpoint()
-        }, sample => {
-          search = sample
-          publishProgress()
+      if (!latest) return
+      const { id, queuedAt } = latest
+      let staged: Draft | undefined
+      let status: StageProgress | undefined
+      let telemetry: PoolStatus | undefined
+      let lastPaint = -Infinity, lastSave = performance.now(), lastPublish = -Infinity
+      let stageStart = performance.now(), stageCount = 0
+      let persisted = ''
+      let saving = Promise.resolve()
+      const copy = (draft: Draft): Draft => ({
+        ...draft, instant: [...draft.instant],
+        work: draft.work && { ...draft.work, reviews: { ...draft.work.reviews } },
+      })
+      const publish = (transition = false) => {
+        if (!status) return
+        const now = performance.now()
+        if (!transition && now - lastPublish < 150) return
+        lastPublish = now
+        const step = status.stage === 'instant' ? status.instant : status.stage === 'critical' ? status.criticalDone : status.checked
+        const total = status.stage === 'instant' ? status.moves + 1 : status.stage === 'critical' ? status.critical : status.moves
+        const processed = step - stageCount
+        const eta = processed >= 2 ? Math.ceil((now - stageStart) * (total - step) / (1000 * processed)) : undefined
+        updateProgress({ id, ...status, automatic, search: telemetry, eta })
+      }
+      const persist = (final?: { draft: Draft; reviews?: Review[] }) => {
+        if (!staged || !status) return saving
+        const stamp = [status.stage, status.instant, status.checked].join(':')
+        if (!final && stamp === persisted) return saving
+        persisted = stamp
+        lastSave = performance.now()
+        const checkpoint = copy(staged)
+        const draft = final ? copy(final.draft) : checkpoint
+        saving = saving.then(async () => {
+          const tx = (await db).transaction('games', 'readwrite')
+          const record = await tx.store.get(id)
+          if (record) {
+            const unchanged = record.queuedAt === queuedAt
+            const finished = !!final?.reviews && unchanged && !controller.signal.aborted
+            // An old task may contribute Instant positions after a mode switch.
+            const completedDraft = final?.reviews && !finished ? checkpoint : draft
+            const updated = { ...record, draft: unchanged ? completedDraft : { ...completedDraft, work: record.draft?.work },
+              ...(finished ? { reviews: final.reviews, queued: false } : {}) }
+            await tx.store.put(updated)
+            await tx.done
+            if (final) mergeGame(updated)
+          } else await tx.done
         })
+        return saving
+      }
+      try {
+        const result = await analyzeProgressively(automatic ? { ...latest, options: settings.engine } : latest,
+          latest.mode ?? settings.mode, controller.signal, async (draft, next) => {
+            const transition = status?.stage !== next.stage
+            status = next
+            staged = draft
+            const now = performance.now()
+            if (transition) {
+              stageStart = now
+              stageCount = next.stage === 'instant' ? next.instant : next.stage === 'critical' ? next.criticalDone : next.checked
+            }
+            publish(transition)
+            if (transition || now - lastPaint >= 225 || next.instant === next.moves + 1 && next.stage === 'instant') {
+              updateLiveReview({ id, draft: copy(draft) })
+              lastPaint = now
+            }
+            if (now - lastSave >= 800 || transition && next.stage !== 'instant') await persist()
+          }, sample => { telemetry = sample; publish() }, automatic)
+        await persist(result)
       } catch (error) {
         if (!controller.signal.aborted) {
           setStatus(error instanceof Error ? error.message : 'Ошибка анализа.')
-          mergeGame(await patchGame(id, { queued: false }))
+          if (automatic) await patchGame(id, { autoPreviewPaused: true })
+          else {
+            const latest = await (await db).get('games', id)
+            if (latest?.queuedAt === queuedAt) await patchGame(id, { queued: false })
+          }
         }
       } finally {
-        await checkpoint()
-        if (staged.length < moves) mergeGame(await (await db).get('games', id))
+        await persist()
+        mergeGame(await (await db).get('games', id))
       }
-
     }
     const work = navigator.locks ? navigator.locks.request('chessmind-queue', { signal: controller.signal }, run) : run()
     void work.catch(error => { if (!controller.signal.aborted) setStatus(error instanceof Error ? error.message : 'Ошибка очереди.') }).finally(() => {
@@ -180,20 +221,22 @@ function App() {
       updateProgress(undefined)
       setActive(undefined)
     })
-  }, [games, visible, active])
+  }, [games, sorted, visible, active, settings.autoPreview])
 
   const open = useCallback((game: Game, ply?: number) => { window.location.hash = 'review/' + game.id + (ply ? '/' + ply : '') }, [])
   function go(page: Page) { window.location.hash = page }
-  async function queueBatch(items: Game[], mode: Mode) {
+  async function queueBatch(items: Game[], mode: Mode, change = false) {
     setStatus('')
+    const running = current.current
+    if (running?.automatic || change && running && items.some(item => item.id === running.id)) running.controller.abort()
     try {
       const tx = (await db).transaction('games', 'readwrite')
       const changed = new Map<string, Game>()
       const queuedAt = Date.now()
       for (const [index, item] of items.entries()) {
         const latest = await tx.store.get(item.id)
-        if (!latest || latest.queued) continue
-        const updated = { ...latest, ...prepareAnalysis(latest, mode, settings.engine), queuedAt: queuedAt + index }
+        if (!latest || latest.queued && !change) continue
+        const updated = { ...latest, ...prepareAnalysis(latest, mode, settings.engine), queuedAt: Math.max(queuedAt + index, (latest.queuedAt ?? 0) + 1), autoPreviewPaused: false }
         if (isComplete(updated)) updated.queued = false
         await tx.store.put(updated)
         changed.set(updated.id, updated)
@@ -202,11 +245,11 @@ function App() {
       setGames(previous => previous.map(game => changed.get(game.id) ?? game))
     } catch { setStatus('Не удалось сохранить очередь анализа.') }
   }
-  function queue(game: Game, mode: Mode) { return queueBatch([game], mode) }
+  function queue(game: Game, mode: Mode) { return queueBatch([game], mode, true) }
   async function pause(game: Game) {
     try {
       if (current.current?.id === game.id) current.current.controller.abort()
-      mergeGame(await patchGame(game.id, { queued: false }))
+      mergeGame(await patchGame(game.id, { queued: false, autoPreviewPaused: true }))
     } catch { setStatus('Не удалось приостановить анализ.') }
   }
   const finished = games.filter(isComplete).length
@@ -222,7 +265,7 @@ function App() {
       <a href="#home" className="brand"><img src="/icon.svg" width="43" height="43" alt="" /><div>Chess<span>Mind</span><small>АНАЛИЗ ПАРТИЙ</small></div></a>
       <nav aria-label="Основные разделы" className="main-nav">{navigation(core)}</nav>
       <nav aria-label="Дополнительные разделы" className="secondary-nav">{navigation(secondary)}</nav>
-      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0.1</small></div>
+      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0.2</small></div>
     </aside>
     <main>
       <header className="topbar">
@@ -250,7 +293,7 @@ function App() {
         }}>Обновить</button></div>}
         {location.page === 'home' && <>
           <section className="hero">
-            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0.1</div>
+            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0.2</div>
               <h1>Разбор шахматных<br className="desktop-break" /> партий</h1>
               <p>Найдите переломные ходы, проверьте варианты Stockfish и потренируйтесь на собственных ошибках.</p>
               <div className="hero-actions"><a className="primary" href="#games"><ArrowDownToLine size={18} /> Добавить партию</a>
@@ -346,6 +389,7 @@ function readEngineOptions(value?: EngineOptions): EngineOptions | undefined {
     full: value.full === true,
     multiplier: [0.5, 1, 2, 3].includes(value.multiplier ?? 0) ? value.multiplier : undefined,
     threads: value.threads === 1 ? 1 : undefined,
+    workers: [1, 2, 3, 4].includes(value.workers ?? 0) ? value.workers : undefined,
     hash: value.hash === 16 || value.hash === 32 || value.hash === 64 ? value.hash : undefined,
     cache: [0, 500, 3000, 6000].includes(value.cache ?? -1) ? value.cache : undefined,
   }
@@ -379,17 +423,25 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
         if (!['chesscom', 'lichess', 'pgn'].includes(row.source) || typeof row.pgn !== 'string') throw new Error('Копия содержит некорректную партию.')
         const game = await parsePgn(row.pgn, row.source, typeof row.owner === 'string' ? row.owner : undefined, typeof row.url === 'string' ? row.url : undefined, row.methodology !== 2)
         if (row.id !== game.id) throw new Error('Контрольная сумма партии не совпадает.')
-        const validReviews = (reviews: Review[]) => Array.isArray(reviews) && reviews.length <= game.moves && reviews.every((item, index) =>
-          item.index === index && Object.hasOwn(categories, item.category) && ['w','b'].includes(item.color) &&
+        const validReview = (item: Review, index: number) => !!item && item.index === index &&
+          Object.hasOwn(categories, item.category) && ['w','b'].includes(item.color) && !item.preliminary &&
           ['opening','middle','end'].includes(item.phase) && [item.loss, item.accuracy, item.depth].every(Number.isFinite) &&
           (item.cpLoss === null || Number.isFinite(item.cpLoss)) && [item.before,item.after,item.played].every(validLine) &&
-          Array.isArray(item.lines) && item.lines.every(validLine) && typeof item.explanation === 'string')
+          Array.isArray(item.lines) && item.lines.every(validLine) && typeof item.explanation === 'string'
+        const validReviews = (reviews: Review[]) => Array.isArray(reviews) && reviews.length <= game.moves && reviews.every(validReview)
+        const validIndex = (index: number) => Number.isInteger(index) && index >= 0 && index < game.moves
+        const draft = row.draft
+        if (draft && (draft.format !== 1 || !Array.isArray(draft.instant) || draft.instant.length !== game.moves + 1 ||
+          !draft.instant.every(line => line === null || validLine(line)) || draft.work &&
+          (typeof draft.work.profile !== 'string' || !Array.isArray(draft.work.critical) || !draft.work.critical.every(validIndex) ||
+           !draft.work.reviews || !Object.entries(draft.work.reviews).every(([key, review]) =>
+             validIndex(Number(key)) && validReview(review, Number(key)))))) throw new Error('Копия содержит некорректный черновик анализа.')
         if (row.reviews && !validReviews(row.reviews) || row.savedAnalyses && (!Array.isArray(row.savedAnalyses) ||
           row.savedAnalyses.some(item => !Object.hasOwn(budgets, item.mode) || !validReviews(item.reviews)))) {
           throw new Error('Копия содержит некорректный анализ.')
         }
         restored.push({ ...game, whiteElo: game.whiteElo ?? historicalRating(row.whiteElo), blackElo: game.blackElo ?? historicalRating(row.blackElo), timestamp: Number.isFinite(row.timestamp) ? row.timestamp : game.timestamp,
-          mode: row.mode && Object.hasOwn(budgets, row.mode) ? row.mode : undefined, reviews: row.reviews,
+          mode: row.mode && Object.hasOwn(budgets, row.mode) ? row.mode : undefined, reviews: row.reviews, draft,
           methodology: row.methodology === 2 ? 2 : 1, options: readEngineOptions(row.options), savedAnalyses: row.savedAnalyses })
 
       }
@@ -405,7 +457,12 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
           const imported = [...(game.savedAnalyses ?? []), ...(game.mode && game.reviews ? [{
             mode: game.mode, methodology: game.methodology, options: game.options, reviews: game.reviews,
           }] : [])]
-          let update = { ...previous, whiteElo: previous.whiteElo ?? game.whiteElo, blackElo: previous.blackElo ?? game.blackElo }
+          const instant = game.draft?.instant.map((line, index) => {
+            const local = previous.draft?.instant[index]
+            return (local?.depth ?? -1) >= (line?.depth ?? -1) ? local ?? null : line
+          })
+          const draft = instant ? { format: 1 as const, instant, work: previous.draft ? previous.draft.work : game.draft?.work } : previous.draft
+          let update = { ...previous, draft, whiteElo: previous.whiteElo ?? game.whiteElo, blackElo: previous.blackElo ?? game.blackElo }
           for (const item of imported) {
             const key = analysisKey(item)
             if (key === existingKey) {
@@ -429,6 +486,7 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
       setPractice(await storage.getAll('practice'))
       if (json.settings && typeof json.settings.nickname === 'string' && ['system','light','dark'].includes(json.settings.theme) && Object.hasOwn(budgets, json.settings.mode)) {
         onSettings({ nickname: json.settings.nickname, theme: json.settings.theme, mode: json.settings.mode, engine: readEngineOptions(json.settings.engine),
+          autoPreview: [1, 3, 5].includes(json.settings.autoPreview) ? json.settings.autoPreview : 0,
           board: ['sage', 'navy', 'gold'].includes(json.settings.board) ? json.settings.board : 'sage' })
       }
       if (json.repertoire && typeof json.repertoire === 'object' && !Array.isArray(json.repertoire)) {
@@ -454,7 +512,11 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
         {Object.entries(budgets).map(([key, value]) => <option value={key} key={key}>{value.label}</option>)}</select></label>
       <label className="field">Цвет доски<select value={settings.board ?? 'sage'} onChange={event => onSettings({ ...settings, board: event.target.value as Settings['board'] })}><option value="sage">Шалфей</option><option value="navy">Тёмно-синий</option><option value="gold">Золотой</option></select></label>
       <label className="field">Бюджет Professional<select value={settings.engine?.multiplier ?? 1} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, multiplier: Number(event.target.value) } })}>{[0.5, 1, 2, 3].map(value => <option key={value} value={value}>{value}×</option>)}</select></label>
-      <label className="field">Потоки Lite<select value={settings.engine?.threads ?? 'auto'} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, threads: event.target.value === '1' ? 1 : undefined } })}><option value="auto">Авто · до 2 потоков</option><option value="1">1 поток</option></select></label>
+      <label className="field">Предварительный анализ последних партий<select value={settings.autoPreview ?? 0} onChange={event =>
+        onSettings({ ...settings, autoPreview: Number(event.target.value) })}>
+        <option value={0}>Выключен</option>{[1, 3, 5].map(count => <option value={count} key={count}>{count} · пока приложение открыто</option>)}
+      </select></label>
+      <label className="field">Параллелизм Lite<select value={settings.engine?.threads ?? 'auto'} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, threads: event.target.value === '1' ? 1 : undefined } })}><option value="auto">Авто</option><option value="1">Один поток</option></select></label>
       <label className="field">Память Stockfish Hash<select value={settings.engine?.hash ?? 'auto'} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, hash: event.target.value === 'auto' ? undefined : Number(event.target.value) as EngineOptions['hash'] } })}><option value="auto">Авто</option>{[16, 32, 64].map(value => <option key={value} value={value}>{value} МБ</option>)}</select></label>
       <label className="action-row"><input type="checkbox" checked={settings.engine?.full ?? false} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, full: event.target.checked } })} /> Stockfish Full · около 95 МиБ при первом запуске</label>
       <div className="action-row"><a href="#endgames">Эндшпили</a><a href="#openings">Дебюты</a><a href="#methodology">Методология</a></div>

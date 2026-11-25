@@ -1,6 +1,6 @@
 import { Chess, type Move } from 'chess.js'
 import type { Game } from './library'
-import { categories, evalLabel, variation } from './review'
+import { categories, evalLabel, variation, type Review } from './review'
 
 const seconds = (value: string) => value.split(':').reduce((total, part) => total * 60 + Number(part), 0)
 
@@ -24,7 +24,7 @@ export function readClocks(pgn: string, moves: Move[], control: string) {
   })
 }
 
-export function annotatedPgn(game: Game) {
+export function annotatedPgn(game: Game, reviews: ReadonlyArray<Review | undefined> | undefined = game.reviews) {
   const board = new Chess()
   board.loadPgn(game.pgn)
   const moves = board.history({ verbose: true })
@@ -32,7 +32,7 @@ export function annotatedPgn(game: Game) {
   const headers = Object.entries(board.getHeaders()).map(([key, value]) =>
     '[' + key + ' "' + value.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replace(/[\r\n]/g, ' ') + '"]')
   const text = moves.map((move, index) => {
-    const review = game.reviews?.[index]
+    const review = reviews?.[index]
     const assessment = review ? [
       'ChessMind ' + (game.methodology ?? 1) + '.0 · ' + categories[review.category][0],
       'Оценка белых ' + evalLabel(review.after),

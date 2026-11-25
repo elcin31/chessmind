@@ -150,11 +150,15 @@ function TaskView({ task, onPractice, next, canNext, multi }: {
       const expectedLine = path.length ? expected : review.before.pv
       const sameMove = notation === expectedLine[0]
       if (!sameMove && (!evaluated || !recommended || evaluated.depth !== recommended.depth)) {
-        recommended = (await engine.evaluate(position, mode, review.critical))[0]
-        evaluated = (await engine.evaluate(position, mode, review.critical, notation, recommended.depth))[0]
-        if (evaluated.depth < recommended.depth && recommended.pv[0]) {
-          recommended = (await engine.evaluate(position, mode, review.critical, recommended.pv[0], evaluated.depth))[0]
+        const check = async () => {
+          recommended = (await engine.evaluate(position, mode, review.critical))[0]
+          evaluated = (await engine.evaluate(position, mode, review.critical, notation, recommended.depth))[0]
+          if (evaluated.depth < recommended.depth && recommended.pv[0]) {
+            recommended = (await engine.evaluate(position, mode, review.critical, recommended.pv[0], evaluated.depth))[0]
+          }
         }
+        if (navigator.locks) await navigator.locks.request('chessmind-queue', { signal: current.signal }, check)
+        else await check()
       }
       if (current.signal.aborted) return
       const correct = sameMove || !!evaluated && !!recommended && sameStrength(evaluated, recommended)

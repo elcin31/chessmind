@@ -1,12 +1,13 @@
 import { Chess, type Color, type Move } from 'chess.js'
 import { openDB, type DBSchema } from 'idb'
+import type { Draft } from './progressive'
 import type { Line, Review } from './review'
 import { drawState } from './rules'
 
 export type Source = 'chesscom' | 'lichess' | 'pgn'
 export type Opening = [eco: string, name: string, pgn: string]
 export type Mode = 'quick' | 'standard' | 'deep' | 'professional'
-export type EngineOptions = { multiplier?: number; full?: boolean; threads?: 1 | 2; hash?: 16 | 32 | 64; cache?: number }
+export type EngineOptions = { multiplier?: number; full?: boolean; threads?: 1 | 2; hash?: 16 | 32 | 64; cache?: number; workers?: 1 | 2 | 3 | 4 }
 export type Analysis = { mode: Mode; methodology?: 1 | 2; options?: EngineOptions; reviews: Review[] }
 export const methodologyVersion = 2
 export const analysisKey = (game: Pick<Game, 'methodology' | 'mode' | 'options'>) =>
@@ -16,7 +17,7 @@ export type Game = {
   id: string; pgn: string; initial: string; source: Source; url?: string; owner?: string;
   white: string; black: string; whiteElo?: number; blackElo?: number;
   date: string; timestamp?: number; result: string; time: string; opening?: Opening; book: number;
-  moves: number; mode?: Mode; reviews?: Review[]; queued?: boolean; queuedAt?: number; methodology?: 1 | 2; options?: EngineOptions; savedAnalyses?: Analysis[]
+  moves: number; mode?: Mode; reviews?: Review[]; queued?: boolean; queuedAt?: number; methodology?: 1 | 2; options?: EngineOptions; savedAnalyses?: Analysis[]; draft?: Draft; autoPreviewPaused?: boolean
 }
 export type Practice = { id: string; correct: number; wrong: number; streak: number; due: number; last: number }
 interface Store extends DBSchema {

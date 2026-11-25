@@ -300,8 +300,6 @@ td:first-child { color: var(--text); }
 .opening-options button[aria-pressed=true] { border-color: var(--gold); background: var(--soft); }
 .heatmap { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: .4rem; }
 .heatmap > div { display: grid; border: 1px solid var(--line); border-radius: 8px; padding: .4rem; text-align: center; }
-.progress-label:has(.search-progress) { flex-wrap: wrap; }
-.search-progress { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: .25rem 1rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 .jump-analyzed { justify-self: start; }
 .player-badge { display: inline-flex; align-items: center; gap: .48rem; min-width: 0; padding: .18rem .35rem .18rem .18rem; border-radius: .45rem; text-align: left; }
 .player-badge.is-owner { background: color-mix(in srgb, #77936b 18%, var(--surface)); }
@@ -333,3 +331,11 @@ td:first-child { color: var(--text); }
 
 .compact-game small { margin-top: 0; }
 .compact-game .player-title { color: var(--muted); }
+
+.analysis-progress { display: grid; gap: .35rem; width: 100%; }
+.analysis-counts,.preview-summary { display: flex; align-items: center; flex-wrap: wrap; gap: .35rem .85rem; font-size: .83rem; color: var(--muted); }
+.analysis-engine { font-size: .8rem; color: var(--muted); }
+.analysis-engine summary { cursor: pointer; width: fit-content; }
+.preview-summary { background: var(--soft); padding: .55rem .7rem; border-radius: .5rem; width: 100%; }
+.preview-summary button { margin-inline-start: auto; min-height: 34px; }
+.analysis-finished { font-size: .83rem; margin: 0; color: var(--muted); }

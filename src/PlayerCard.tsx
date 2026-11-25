@@ -3,6 +3,7 @@ import type { Color } from 'chess.js'
 import { ArrowRight, UserRound } from 'lucide-react'
 import { displayDate, isComplete, playerColor, timeLabel, type Game } from './library'
 import { profileRetryAt, profileSource, requestProfile, type ProfileSource } from './playerProfiles'
+import { hasPreview } from './progressive'
 import { summarize } from './review'
 
 const percent = (value?: number) => value === undefined ? '—' : value.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%'
@@ -73,7 +74,7 @@ export const GameCard = memo(function GameCard({ game, nickname, open, recent = 
   const complete = isComplete(game)
   const owner = playerColor(game, nickname)
   const source = profileSource(game)
-  const status = game.queued ? 'В очереди' : complete ? 'Разобрана' : game.reviews?.length ? 'Приостановлена' : 'Без анализа'
+  const status = game.queued ? 'В очереди' : complete ? 'Разобрана' : game.reviews?.length || game.draft?.work ? 'Приостановлена' : hasPreview(game) ? 'Предварительный разбор' : 'Без анализа'
   return <button className={'game-row compact-game' + (recent ? ' compact-game-recent' : '')} onClick={() => open(game)}
     aria-label={game.white + ' – ' + game.black + ' · ' + game.result + ' · ' + status}>
     <span className="game-match">

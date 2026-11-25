@@ -1,5 +1,5 @@
 import { Chess, type Color, type Move, type PieceSymbol, type Square } from 'chess.js'
-import { Engine, type Position, type SearchSpeed } from './engine'
+import { Engine, type Position } from './engine'
 import { analysisKey, gameMoves, playUci, uci, type Game, type Mode } from './library'
 import { explain } from './coach'
 import { drawState, positionKey } from './rules'
@@ -19,7 +19,7 @@ export type Phase = keyof typeof phases
 export type Review = {
   color: Color; index: number; category: Category; before: Line; played: Line; after: Line; lines: Line[];
   loss: number; cpLoss: number | null; accuracy: number; phase: Phase; explanation: string; motif?: string;
-  critical: boolean; depth: number; forced: boolean; reliable?: boolean;
+  critical: boolean; depth: number; forced: boolean; reliable?: boolean; preliminary?: boolean;
   reasons?: string[]; complexity?: 'Низкая' | 'Средняя' | 'Высокая'; sacrificeType?: string; draw?: string
 }
 
@@ -131,7 +131,7 @@ export function assess(lines: Line[], played: Line, move: Move, after: Line, boo
   return { category, loss, cpLoss, gap, forced, unique, lostMate, allowsMate, reliable, reasons, complexity, sacrificeType }
 }
 
-function phaseFor(move: Move, index: number, book: number): Phase {
+export function phaseFor(move: Move, index: number, book: number): Phase {
   const board = new Chess(move.before).board().flat()
   const remaining = board.reduce((total, piece) => piece && piece.type !== 'p' ? total + pieceValue[piece.type] : total, 0)
   if (remaining <= 24) return 'end'
@@ -139,7 +139,7 @@ function phaseFor(move: Move, index: number, book: number): Phase {
   return 'middle'
 }
 
-function positionsFor(game: Game, moves: Move[]) {
+export function positionsFor(game: Game, moves: Move[]) {
   const seen = new Map([[positionKey(game.initial), 1]])
   let initial = game.initial
   let played: string[] = []
@@ -161,7 +161,8 @@ function positionsFor(game: Game, moves: Move[]) {
 
 type Root = { lines: Line[]; deep: boolean }
 
-async function analyzeMove(game: Game, mode: Mode, engine: Engine, index: number, moves: Move[], positions: Position[], historyRoot?: Root, force = false) {
+export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, 'evaluate'>, index: number,
+  moves: Move[], positions: Position[], historyRoot?: Root, force = false, prioritized = false) {
   const move = moves[index]
   const notation = uci(move)
   const current = positions[index], child = positions[index + 1]
@@ -201,7 +202,7 @@ async function analyzeMove(game: Game, mode: Mode, engine: Engine, index: number
       expectation(pair.played, move.color, !!pair.played.wdl && !!childLine.wdl) -
       expectation(childLine, move.color, !!pair.played.wdl && !!childLine.wdl) >= 10)
   const critical = force || !preliminary.forced && !!root.lines[0].pv.length &&
-    (expressDisagreement || preliminary.loss >= 7 || preliminary.gap >= 14 || preliminary.lostMate || preliminary.allowsMate || sacrifice(move, baseChild.lines[0]))
+    (prioritized || expressDisagreement || preliminary.loss >= 7 || preliminary.gap >= 14 || preliminary.lostMate || preliminary.allowsMate || sacrifice(move, baseChild.lines[0]))
   if (critical && !root.deep) {
     root = { lines: await engine.evaluate(current, mode, true), deep: true }
     pair = await compare()
@@ -246,24 +247,6 @@ export async function recheckMove(game: Game, index: number, signal: AbortSignal
   const engine = new Engine(signal, game.options, undefined, game.id)
   try { return (await analyzeMove(game, 'professional', engine, index, moves, positionsFor(game, moves), undefined, true)).review }
   finally { engine.close(); await engine.flush() }
-}
-
-export async function analyzeGame(game: Game, mode: Mode, signal: AbortSignal, save: (review: Review[]) => Promise<void>,
-  report?: (sample: SearchSpeed) => void) {
-  const moves = gameMoves(game)
-  const engine = new Engine(signal, game.options, report, game.id)
-  const reviews = game.methodology === 2 && game.mode === mode ? [...(game.reviews ?? [])] : []
-  const positions = positionsFor(game, moves)
-  let root: Root | undefined
-  try {
-    for (let i = reviews.length; i < moves.length; i++) {
-      signal.throwIfAborted()
-      const current = await analyzeMove(game, mode, engine, i, moves, positions, root)
-      root = current.next
-      reviews.push(current.review)
-      if (!signal.aborted) await save(reviews)
-    }
-  } finally { engine.close(); await engine.flush() }
 }
 
 export function average(values: number[]) {

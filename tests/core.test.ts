@@ -5,6 +5,7 @@ import { Chess } from 'chess.js'
 import { drawState, positionKey } from '../src/rules'
 import { assess, expectation, sacrifice, summarize, winProbability, type Line } from '../src/review'
 import { analysisKey, db, gameMoves, importAccount, importPgn, parsePgn } from '../src/library'
+import { inspectDraft } from '../src/progressive'
 import { annotatedPgn, readClocks } from '../src/pgn'
 import { immortal, opera } from './fixtures'
 
@@ -65,6 +66,23 @@ test('исторический пример жертвы и обычный ра�
   const step = played.find(move => move.san === 'Bd6')!
   const tail = played.slice(played.indexOf(step) + 1).map(move => move.lan)
   assert.equal(sacrifice(step, { ...line(250, tail[0]), pv: tail }), true)
+  const best = line(250, step.lan, [800, 150, 50])
+  const other = new Chess(step.before).moves({ verbose: true }).find(move => move.lan !== step.lan)!
+  const reply = { ...line(250, tail[0], [800, 150, 50]), pv: tail }
+  const options = [best, line(0, other.lan, [100, 800, 100])]
+  assert.equal(assess(options, best, step, reply, false, true).category, 'brilliant')
+  assert.notEqual(assess(options, best, step, reply, false, false).category, 'brilliant')
+  const index = played.indexOf(step)
+  const draft = { format: 1 as const, instant: Array<Line | null>(played.length + 1).fill(null) }
+  draft.instant[index] = best
+  draft.instant[index + 1] = reply
+  const preview = inspectDraft({
+    id: 'immortal', pgn: immortal, moves: played.length, initial: played[0].before,
+    source: 'pgn', book: 0, date: '', result: '1-0', time: '', white: 'Anderssen', black: 'Kieseritzky',
+  }, draft, index, played)!
+  assert.equal(preview.preliminary, true)
+  assert.notEqual(preview.category, 'brilliant')
+
   const exchange = played.find(move => move.san === 'exf4')!
   assert.equal(sacrifice(exchange, line(20, 'f1c4')), false)
 })

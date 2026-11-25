@@ -12,7 +12,7 @@ export const budgets = {
 
 export type Position = { initial: string; moves: string[]; fen: string; repetitions?: number; legal?: number }
 export type SearchSpeed = { depth: number; nps: number; engine: string }
-type Configuration = { full: boolean; threads: 1 | 2; hash: number }
+type Configuration = { full: boolean; threads: 1 | 2; hash: number; saving?: boolean }
 type Session = { worker: Worker; config: Configuration; game?: string; count?: number; position?: string }
 type CacheEntry = { lines: Line[]; used: number }
 const abortError = () => new DOMException('Анализ приостановлен.', 'AbortError')
@@ -36,7 +36,7 @@ function park(session: Session) {
   }, 25_000) }
 }
 
-async function deviceConfiguration(options: EngineOptions): Promise<Configuration> {
+export async function deviceConfiguration(options: EngineOptions): Promise<Configuration> {
   const device = navigator as Navigator & { deviceMemory?: number; getBattery?: () => Promise<{ charging: boolean; level: number }> }
   const mobile = /Android|iPhone|iPad|Mobile/.test(device.userAgent) || device.platform === 'MacIntel' && device.maxTouchPoints > 1
   const cores = device.hardwareConcurrency || 2
@@ -46,7 +46,7 @@ async function deviceConfiguration(options: EngineOptions): Promise<Configuratio
   const canThread = crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined' && cores >= 4 &&
     (!mobile || memory === undefined || memory >= 4) && !saving
   return {
-    full: options.full === true,
+    full: options.full === true, saving,
     threads: !options.full && options.threads !== 1 && canThread ? 2 : 1,
     hash: options.hash ?? (mobile || saving || memory !== undefined && memory < 4 ? 16 : memory !== undefined && memory >= 8 ? 64 : 32),
   }
@@ -66,11 +66,14 @@ export class Engine {
   constructor(private signal: AbortSignal, private options: EngineOptions = {},
     private progress?: (sample: SearchSpeed) => void, private game?: string) {}
 
-  close() {
+  get activeThreads() { return this.session?.config.threads ?? 0 }
+  get activeWorker() { return !!this.session }
+
+  close(reuse = true) {
     const session = this.session
     this.session = undefined
     if (!session) return
-    if (this.initialized && !this.onCommand) park(session)
+    if (reuse && this.initialized && !this.onCommand) park(session)
     else session.worker.terminate()
     this.initialized = false
   }
@@ -155,7 +158,7 @@ export class Engine {
     this.initialized = true
   }
 
-  async evaluate(position: Position, mode: Mode, critical = false, only?: string | readonly string[], targetDepth?: number, targetNodes?: number): Promise<Line[]> {
+  async evaluate(position: Position, mode: Mode, critical = false, only?: string | readonly string[], targetDepth?: number, targetNodes?: number, maxLines?: number): Promise<Line[]> {
     this.signal.throwIfAborted()
     const board = new Chess(position.fen)
     const legal = position.legal ?? board.perft(1)
@@ -168,7 +171,7 @@ export class Engine {
     const budget = budgets[mode]
     const depth = targetDepth ?? budget.depth + (critical ? budget.extra : 0)
     const multiplier = mode === 'professional' ? Math.max(0.5, Math.min(3, this.options.multiplier ?? 1)) : 1
-    const count = typeof only === 'string' ? 1 : Math.min(legal, only?.length ?? budget.lines)
+    const count = typeof only === 'string' ? 1 : Math.min(legal, only?.length ?? maxLines ?? budget.lines)
     const nodesPerSearch = Math.round(budget.nodes * (critical ? 3 : 1) * multiplier)
     const nodes = targetNodes ?? nodesPerSearch * (only && typeof only !== 'string' ? count : 1)
     const history = position.initial + (position.moves.length ? ' moves ' + position.moves.join(' ') : '')
