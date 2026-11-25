@@ -22,13 +22,16 @@ export async function poolConfiguration(options: EngineOptions) {
   const mobile = /Android|iPhone|iPad|Mobile/.test(device.userAgent) || device.platform === 'MacIntel' && device.maxTouchPoints > 1
   const memory = device.deviceMemory
   const enoughMemory = memory === undefined ? !mobile || cores >= 6 : memory >= 4
-  const safe = options.full || !enoughMemory || config.saving ? 1 :
-    Math.min(mobile ? 2 : 4, Math.max(1, Math.floor((cores + (mobile ? 0 : 1)) / 2)), memory === undefined || memory < 8 ? 2 : 4)
+  const eco = options.energy === 'eco'
+  const turbo = options.energy === 'turbo' && memory !== undefined && memory >= 8
+  const coreLimit = turbo ? cores - 1 : Math.floor((cores + (mobile ? 0 : 1)) / 2)
+  const safe = eco || options.full || !enoughMemory || config.saving ? 1 :
+    Math.min(mobile ? turbo ? 3 : 2 : 4, Math.max(1, coreLimit), memory === undefined || memory < 8 ? 2 : 4)
   const requested = options.workers && [1, 2, 3, 4].includes(options.workers)
     ? options.workers : options.threads === 1 ? 1 : safe
   const workers = Math.min(requested, safe)
-  const threads = workers > 1 || options.threads === 1 ? 1 : config.threads
-  const hash = options.hash ?? (workers > 1 ? (mobile || memory === undefined ? 16 : 32) : config.hash)
+  const threads = eco || workers > 1 || options.threads === 1 ? 1 : config.threads
+  const hash = options.hash ?? (eco ? 16 : workers > 1 ? (mobile || memory === undefined ? 16 : 32) : config.hash)
   return { workers, threads, hash: hash as EngineOptions['hash'] }
 }
 
@@ -128,7 +131,13 @@ export class SearchPool {
       slot.busy = work
       slot.sample = undefined
       const execute = async () => {
-        try { work.resolve(await slot.engine.evaluate(...work.args)) }
+        const started = performance.now()
+        try {
+          work.resolve(await slot.engine.evaluate(...work.args))
+          if (this.options.energy === 'eco' && !this.signal.aborted) {
+            await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(15, (performance.now() - started) / 5))))
+          }
+        }
         catch (error) {
           if (this.signal.aborted || this.limit === 1) { work.reject(error); return }
           // Memory/worker failure under load. Requeue this search unchanged.

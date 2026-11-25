@@ -1,7 +1,9 @@
 import { Chess, type Square } from 'chess.js'
-import { analysisKey, gameMoves, uci, type Game, type Mode } from './library'
+import { analysisKey, gameMoves, uci, type Game, type Mode } from './game'
 import { analyzeMove, expectation, moveAccuracy, positionsFor, sacrifice, type Line, type Review } from './review'
-import { poolConfiguration, SearchPool, type PoolStatus } from './searchPool'
+import type { PoolStatus } from './searchPool'
+import type { EngineOptions } from './game'
+import type { Engine } from './engine'
 
 export const stageLabels = {
   instant: 'Предварительный разбор',
@@ -71,7 +73,15 @@ function criticalPositions(game: Game, draft: Draft, moves: ReturnType<typeof ga
     .slice(0, Math.max(6, Math.ceil(moves.length / 4))).map(item => item.index)
 }
 
-async function runStage(pool: SearchPool, remaining: number[], signal: AbortSignal, work: (index: number) => Promise<void>) {
+type WorkPool = {
+  capacity: number;
+  priority(index: number): number | undefined;
+  at(index: number): Pick<Engine, 'evaluate'>;
+  close(): Promise<void>;
+}
+type CreatePool = (options: EngineOptions) => Promise<WorkPool>
+
+async function runStage(pool: WorkPool, remaining: number[], signal: AbortSignal, work: (index: number) => Promise<void>) {
   let failed = false
   const loop = async () => {
     try {
@@ -97,7 +107,7 @@ async function runStage(pool: SearchPool, remaining: number[], signal: AbortSign
 }
 
 export async function analyzeProgressively(game: Game, mode: Mode, signal: AbortSignal,
-  update: (draft: Draft, status: StageProgress) => Promise<void>, telemetry: (status: PoolStatus) => void, previewOnly = false) {
+  update: (draft: Draft, status: StageProgress) => Promise<void>, telemetry: (status: PoolStatus) => void, previewOnly = false, createPool?: CreatePool) {
   const moves = gameMoves(game)
   if (!moves.length || moves.length !== game.moves || !['1-0', '0-1', '1/2-1/2'].includes(game.result)) {
     throw new Error('Для анализа требуется запись завершённой партии.')
@@ -112,8 +122,11 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
   }
   const options = game.options ?? {}
   const previewOptions = { ...options, full: false }
-  const config = await poolConfiguration(previewOptions)
-  let pool = new SearchPool(signal, game.id, previewOptions, config, telemetry)
+  const makePool = createPool ?? (async (config: EngineOptions) => {
+    const { SearchPool, poolConfiguration } = await import('./searchPool')
+    return new SearchPool(signal, game.id, config, await poolConfiguration(config), telemetry)
+  })
+  let pool = await makePool(previewOptions)
   let instant = draft.instant.filter(Boolean).length
   let checked = Object.keys(oldWork?.reviews ?? {}).length
   let criticalDone = oldWork?.critical.filter(index => !!oldWork.reviews[index]).length ?? 0
@@ -136,7 +149,7 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
     // Full keeps a single worker. The preview always uses the smaller Lite build.
     if (options.full && checked < moves.length) {
       await pool.close()
-      pool = new SearchPool(signal, game.id, options, await poolConfiguration(options), telemetry)
+      pool = await makePool(options)
     }
     if (!draft.work) {
       draft.work = {

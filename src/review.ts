@@ -1,6 +1,7 @@
 import { Chess, type Color, type Move, type PieceSymbol, type Square } from 'chess.js'
-import { Engine, type Position } from './engine'
-import { analysisKey, gameMoves, playUci, uci, type Game, type Mode } from './library'
+import type { Engine } from './engine'
+import type { Position } from './stockfish'
+import { analysisKey, gameMoves, playUci, uci, type Game, type Mode } from './game'
 import { explain } from './coach'
 import { drawState, positionKey } from './rules'
 
@@ -243,6 +244,7 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
 }
 
 export async function recheckMove(game: Game, index: number, signal: AbortSignal) {
+  const { Engine } = await import('./engine')
   const moves = gameMoves(game)
   const engine = new Engine(signal, game.options, undefined, game.id)
   try { return (await analyzeMove(game, 'professional', engine, index, moves, positionsFor(game, moves), undefined, true)).review }

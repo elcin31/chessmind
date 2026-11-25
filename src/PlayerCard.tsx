@@ -74,7 +74,7 @@ export const GameCard = memo(function GameCard({ game, nickname, open, recent = 
   const complete = isComplete(game)
   const owner = playerColor(game, nickname)
   const source = profileSource(game)
-  const status = game.queued ? 'В очереди' : complete ? 'Разобрана' : game.reviews?.length || game.draft?.work ? 'Приостановлена' : hasPreview(game) ? 'Предварительный разбор' : 'Без анализа'
+  const status = game.queued ? 'В очереди' : complete ? 'Разобрана' : game.reviews?.length || (game.compute === 'cloud' ? game.cloudDraft?.work : game.draft?.work) ? 'Приостановлена' : hasPreview(game) ? 'Предварительный разбор' : 'Без анализа'
   return <button className={'game-row compact-game' + (recent ? ' compact-game-recent' : '')} onClick={() => open(game)}
     aria-label={game.white + ' – ' + game.black + ' · ' + game.result + ' · ' + status}>
     <span className="game-match">

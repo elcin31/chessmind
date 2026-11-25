@@ -1,16 +1,10 @@
-import { Chess } from 'chess.js'
 import { db, type Mode, type EngineOptions } from './library'
 import type { Line } from './review'
-import { drawState } from './rules'
 
-export const budgets = {
-  quick: { label: 'Express', depth: 10, extra: 3, lines: 2, nodes: 45_000 },
-  standard: { label: 'Standard', depth: 15, extra: 4, lines: 3, nodes: 220_000 },
-  deep: { label: 'Deep', depth: 19, extra: 5, lines: 3, nodes: 950_000 },
-  professional: { label: 'Professional', depth: 23, extra: 6, lines: 4, nodes: 2_000_000 },
-}
+import { collectLines, searchParameters, type Position } from './stockfish'
+export { budgets } from './stockfish'
+export type { Position } from './stockfish'
 
-export type Position = { initial: string; moves: string[]; fen: string; repetitions?: number; legal?: number }
 export type SearchSpeed = { depth: number; nps: number; engine: string }
 type Configuration = { full: boolean; threads: 1 | 2; hash: number; saving?: boolean }
 type Session = { worker: Worker; config: Configuration; game?: string; count?: number; position?: string }
@@ -47,8 +41,8 @@ export async function deviceConfiguration(options: EngineOptions): Promise<Confi
     (!mobile || memory === undefined || memory >= 4) && !saving
   return {
     full: options.full === true, saving,
-    threads: !options.full && options.threads !== 1 && canThread ? 2 : 1,
-    hash: options.hash ?? (mobile || saving || memory !== undefined && memory < 4 ? 16 : memory !== undefined && memory >= 8 ? 64 : 32),
+    threads: !options.full && options.energy !== 'eco' && options.threads !== 1 && canThread ? 2 : 1,
+    hash: options.hash ?? (options.energy === 'eco' || mobile || saving || memory !== undefined && memory < 4 ? 16 : memory !== undefined && memory >= 8 ? 64 : 32),
   }
 }
 
@@ -160,21 +154,9 @@ export class Engine {
 
   async evaluate(position: Position, mode: Mode, critical = false, only?: string | readonly string[], targetDepth?: number, targetNodes?: number, maxLines?: number): Promise<Line[]> {
     this.signal.throwIfAborted()
-    const board = new Chess(position.fen)
-    const legal = position.legal ?? board.perft(1)
-    const turn = board.turn() === 'w' ? 1 : -1
-    if (!legal) return [{ kind: board.isCheck() ? 'mate' : 'cp', value: board.isCheck() ? -turn : 0, pv: [], depth: 0,
-      wdl: board.isCheck() ? (turn === 1 ? [0, 0, 1000] : [1000, 0, 0]) : [0, 1000, 0] }]
-    if (drawState(board, position.repetitions, legal)?.automatic) return [{ kind: 'cp', value: 0, pv: [], depth: 0, wdl: [0, 1000, 0] }]
-
-    const choices = typeof only === 'string' ? only : only?.join(' ')
-    const budget = budgets[mode]
-    const depth = targetDepth ?? budget.depth + (critical ? budget.extra : 0)
-    const multiplier = mode === 'professional' ? Math.max(0.5, Math.min(3, this.options.multiplier ?? 1)) : 1
-    const count = typeof only === 'string' ? 1 : Math.min(legal, only?.length ?? maxLines ?? budget.lines)
-    const nodesPerSearch = Math.round(budget.nodes * (critical ? 3 : 1) * multiplier)
-    const nodes = targetNodes ?? nodesPerSearch * (only && typeof only !== 'string' ? count : 1)
-    const history = position.initial + (position.moves.length ? ' moves ' + position.moves.join(' ') : '')
+    const parameters = searchParameters(position, mode, this.options, critical, only, targetDepth, targetNodes, maxLines)
+    if (parameters.terminal) return parameters.terminal
+    const { depth, nodes, count, choices, history, turn } = parameters
     const limit = this.options.cache ?? 3000
     let config = this.configured ??= await deviceConfiguration(this.options)
     const keyFor = () => JSON.stringify(['2.0.1:19.0.1', config.full, config.threads, config.hash, depth, nodes, count, choices, history])
@@ -212,45 +194,15 @@ export class Engine {
       session.position = history
     }
     commands.push('go depth ' + depth + ' nodes ' + nodes + (choices ? ' searchmoves ' + choices : ''))
-    const iterations = new Map<number, Map<number, Line>>()
-    const name = engineName(config)
-    let totalNodes = 0
+    const output = collectLines(count, turn, engineName(config))
     await this.exchange(commands, 'bestmove', 150_000, line => {
-      if (!line.startsWith('info depth ')) return
-      const work = /\bnodes (\d+) nps (\d+)/.exec(line)
-      if (work) {
-        totalNodes = Math.max(totalNodes, Number(work[1]))
-        if (this.progress && performance.now() - this.lastSample >= 250) {
-          this.lastSample = performance.now()
-          this.progress({ depth: Number(line.match(/^info depth (\d+)/)?.[1]), nps: Number(work[2]), engine: name })
-        }
+      const sample = output.receive(line)
+      if (sample && this.progress && performance.now() - this.lastSample >= 250) {
+        this.lastSample = performance.now()
+        this.progress(sample)
       }
-      const match = /^info depth (\d+).*? multipv (\d+) score (cp|mate) (-?\d+)(.*) pv (.+)$/.exec(line)
-      if (!match || /lowerbound|upperbound/.test(match[5])) return
-      const actualDepth = Number(match[1])
-      const multipv = Number(match[2])
-      const raw = Number(match[4])
-      const wdl = match[5].match(/wdl (\d+) (\d+) (\d+)/)?.slice(1).map(Number) as Line['wdl']
-      if (wdl && turn < 0) wdl.reverse()
-      const group = iterations.get(actualDepth) ?? new Map<number, Line>()
-      group.set(multipv, { kind: match[3] as Line['kind'], value: (match[3] === 'mate' && raw === 0 ? -1 : raw) * turn,
-        pv: match[6].trim().split(/\s+/), depth: actualDepth, wdl })
-      iterations.set(actualDepth, group)
     })
-    let deepest = 0
-    for (const [actual, group] of iterations) if (group.size === count) deepest = Math.max(actual, deepest)
-    const ranked = iterations.get(deepest)
-    if (!ranked) throw new Error('Stockfish не вернул полный набор вариантов.')
-    const previous = iterations.get(deepest - 1)
-    const lines = Array.from({ length: count }, (_, index) => {
-      const rank = index + 1
-      const line = ranked.get(rank)!
-      const prior = previous?.size === count ? [...previous.values()].find(item => item.pv[0] === line.pv[0]) : undefined
-      const stable = !!prior && prior.kind === line.kind &&
-        (line.kind === 'mate' ? Math.sign(prior.value) === Math.sign(line.value) : Math.abs(prior.value - line.value) <= 35) &&
-        (rank !== 1 || previous?.get(1)?.pv[0] === line.pv[0])
-      return { ...line, stable, engine: name, nodes: totalNodes }
-    })
+    const lines = output.results()
     this.remember(key, lines)
     if (limit) {
       this.pending.set(key, { lines, used: Date.now() })

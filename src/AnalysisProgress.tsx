@@ -1,8 +1,9 @@
 import { useSyncExternalStore } from 'react'
 import { stageLabels, type Draft, type StageProgress } from './progressive'
+import type { ComputeEngine } from './cloudProtocol'
 import type { PoolStatus } from './searchPool'
 
-type Progress = StageProgress & { id: string; eta?: number; search?: PoolStatus; automatic: boolean }
+type Progress = StageProgress & { id: string; eta?: number; search?: PoolStatus; automatic: boolean; compute: ComputeEngine }
 let progress: Progress | undefined
 const listeners = new Set<() => void>()
 function subscribe(callback: () => void) {
@@ -49,6 +50,7 @@ export function AnalysisProgress({ id, initial, checked, total, running, queued 
       <span>{rate}%</span>
     </div>
     <div className="analysis-counts">
+      {live && <span>{live.compute === 'cloud' ? 'Облако' : 'На устройстве'}</span>}
       <span>Позиции {prepared}/{total + 1}</span>
       {live && live.critical > 0 && <span>Критические {live.criticalDone}/{live.critical}</span>}
       {!live?.automatic && <span>Проверено ходов {finalCount}/{total}</span>}
