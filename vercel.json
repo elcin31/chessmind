@@ -2,11 +2,29 @@
   "framework": "vite",
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
-  "routes": [
-    {"src":"/(.*)","headers":{"Cross-Origin-Opener-Policy":"same-origin","Cross-Origin-Embedder-Policy":"require-corp"},"continue":true},
-    {"src":"/sw\\.js","headers":{"Cache-Control":"no-cache"},"continue":true},
-    {"src":"/api/engine/status/?","methods":["GET","HEAD"],"dest":"/cloud-status.json","headers":{"Cache-Control":"no-store"}},
-    {"src":"/api/engine/analyze(?:/.*)?","status":503,"headers":{"Cache-Control":"no-store"}},
-    {"handle":"filesystem"}
+  "functions": {
+    "api/engine/analyze.ts": {
+      "regions": ["iad1"],
+      "maxDuration": 30,
+      "supportsCancellation": true,
+      "includeFiles": "{public/eco.json,server/engine/wasm-worker.cjs,node_modules/stockfish/bin/stockfish-19-lite-single.*}"
+    },
+    "api/engine/status.ts": {
+      "regions": ["iad1"],
+      "maxDuration": 5
+    }
+  },
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" },
+        { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" }
+      ]
+    },
+    {
+      "source": "/sw.js",
+      "headers": [{ "key": "Cache-Control", "value": "no-cache" }]
+    }
   ]
 }

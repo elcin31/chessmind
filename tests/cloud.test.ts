@@ -41,7 +41,7 @@ test('запуск только для подтверждённой архиво
   assert.equal((await tampered(post({ ...base, reference: { platform: 'lichess', id: 'ab\nquit' } }))).status, 400)
   assert.equal((await tampered(post({ ...base, mode: 'professional' }))).status, 422)
   assert.equal((await tampered(post({ ...base, padding: 'x'.repeat(1800) }))).status, 413)
-  const quota = engineHandler({ ...options, admission: sampleAdmission(0), request: async () => { assert.fail('network') } })
+  const quota = engineHandler({ ...options, admission: sampleAdmission(0), request: trusted() })
   const exhausted = await quota(await cloudRequest(sample, 'quick'))
   assert.equal(exhausted.status, 429)
   assert.equal((await exhausted.json()).code, 'quota')
@@ -63,7 +63,9 @@ test('поток реального Stockfish WASM, повтор и одновр
   assert.equal(result.reviews.at(-1).after.kind, 'mate')
   assert.deepEqual(result.reviews.at(-1).after.wdl, [1000, 0, 0])
   assert.ok(result.metrics.cpuMs > 0)
-  assert.equal((await handle(await cloudRequest(sample, 'quick'))).status, 429)
+  const replay = await eventsFrom(await handle(await cloudRequest(sample, 'quick')))
+  assert.equal(replay[0].cached, true)
+  assert.deepEqual(replay.at(-1).reviews, result.reviews)
   assert.deepEqual(await admission.status(), {
     remainingCpuMs: cloudLimits.monthCpuMs - cloudLimits.reservationCpuMs, busy: false,
   })
@@ -80,6 +82,7 @@ test('разрыв потока прекращает вычисление и о�
   assert.deepEqual(await admission.status(), {
     remainingCpuMs: cloudLimits.monthCpuMs - cloudLimits.reservationCpuMs, busy: false,
   })
+  assert.equal((await handle(await cloudRequest(sample, 'quick'))).status, 429)
 })
 
 test('клиент принимает проверенный итог с сервера и позиции всех этапов', async ({ mock }) => {

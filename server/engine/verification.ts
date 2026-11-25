@@ -1,5 +1,5 @@
-import type { GameReference } from '../../src/cloudProtocol'
-import { cloudLimits } from '../../src/cloudProtocol'
+import type { GameReference } from '../../src/cloudProtocol.js'
+import { cloudLimits } from '../../src/cloudProtocol.js'
 
 export class RequestFailure extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message) }

@@ -1,7 +1,7 @@
 import { Chess } from 'chess.js'
-import { drawState } from './rules'
-import type { EngineOptions, Mode } from './game'
-import type { Line } from './review'
+import { drawState } from './rules.js'
+import type { EngineOptions, Mode } from './game.js'
+import type { Line } from './review.js'
 
 export const budgets = {
   quick: { label: 'Express', depth: 10, extra: 3, lines: 2, nodes: 45_000 },

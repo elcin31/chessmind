@@ -1,8 +1,8 @@
 import { openDB, type DBSchema } from 'idb'
-import type { Line, Review } from './review'
+import type { Line, Review } from './review.js'
 
-import { historicalRating, readGame, type Game, type Opening, type Source } from './game'
-export * from './game'
+import { historicalRating, readGame, type Game, type Opening, type Source } from './game.js'
+export * from './game.js'
 
 export type Practice = { id: string; correct: number; wrong: number; streak: number; due: number; last: number }
 interface Store extends DBSchema {

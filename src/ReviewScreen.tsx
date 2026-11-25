@@ -1,7 +1,7 @@
 import { Chess, DEFAULT_POSITION, type Color, type Move, type Square } from 'chess.js'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeftRight, ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Cpu, Flag, Pause, Play, RotateCcw, ScanLine, Target } from 'lucide-react'
-import { cloudBlocker, useCloudStatus } from './cloudClient'
+import { cloudBlocker, cloudState, useCloudStatus } from './cloudClient'
 import { ComputeSelect, computeLabels } from './ComputeSettings'
 import { cloudOptions, type ComputeSource } from './cloudProtocol'
 import { AnalysisProgress, useLiveReview } from './AnalysisProgress'
@@ -191,7 +191,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
         {reviews.some(item => !item.preliminary) && <button onClick={download}>PGN с разбором</button>}
       </div>
       {!saved && computeSource !== 'local' && <div className="preview-summary" role="status">
-        <span>{blocker ?? 'Облачный движок доступен.'}</span>
+        <span>{blocker ?? cloudState(cloud)}</span>
       </div>}
       {offerLocal && <button onClick={switchLocal}>Продолжить на устройстве</button>}
       {!saved && !completed && (game.queued || active === game.id || reviews.some(item => !item.preliminary) || !!instantCount && instantCount < moves.length + 1) && <>
@@ -204,6 +204,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
         {rankedErrors.length > 0 && <button onClick={() => navigate(rankedErrors[0].index + 1)}>К переломному моменту</button>}
       </div>}
       {completed && <p className="analysis-finished">Анализ завершён · {computeLabels[game.compute ?? 'local']}</p>}
+      {completed && !saved && game.compute === 'cloud' && game.cloudCacheHit && <p className="muted">Найден готовый анализ в кэше.</p>}
     </section>
     <div className="review-layout">
       <section className="board-column">

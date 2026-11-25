@@ -1,13 +1,16 @@
 import { Chess } from 'chess.js'
-import type { Admission } from '../server/engine/function'
+import type { Admission, CloudResult } from '../server/engine/quota'
 import { cloudLimits, gameFingerprint, type CloudMode } from '../src/cloudProtocol'
 import { readGame } from '../src/game'
 
 export function sampleAdmission(cpuMs: number = cloudLimits.monthCpuMs) {
   const jobs = new Set<string>()
+  const results = new Map<string, CloudResult>()
   let busy = false
   const admission: Admission = {
     async status() { return { remainingCpuMs: cpuMs, busy } },
+    async preflight() { return { ip: 'ip', session: 'session' } },
+    async lookup(key) { return results.get(key) },
     async reserve(key, cost) {
       if (jobs.has(key)) return 'duplicate'
       if (cpuMs < cost || jobs.size >= cloudLimits.jobsPerMonth) return 'quota'
@@ -15,7 +18,7 @@ export function sampleAdmission(cpuMs: number = cloudLimits.monthCpuMs) {
       cpuMs -= cost
       jobs.add(key)
       busy = true
-      return { async release() { busy = false } }
+      return { async release() { busy = false }, async save(result) { results.set(key, result) } }
     },
   }
   return admission

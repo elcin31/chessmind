@@ -1,17 +1,30 @@
-// Local, single-process measurement harness. Admission and archive fixtures
-// exercise the handler here only. This script is not a deployment entry point.
+// Loopback benchmark with archived fixtures and optional local Redis.
+import { execFile } from 'node:child_process'
 import { createServer } from 'node:http'
 import { Readable } from 'node:stream'
+import { promisify } from 'node:util'
+import type { Redis } from '@upstash/redis'
 import { engineHandler } from '../server/engine/function'
+import { RedisAdmission } from '../server/engine/quota'
 import { cloudRequest, ending, sampleAdmission } from '../tests/cloudFixtures'
 import { immortal, opera } from '../tests/fixtures'
 
-const fixtures = { Bench001: opera, Bench002: immortal }
+const fixtures = process.env.BENCH_GAMES === 'opera' ? { Bench001: opera } : { Bench001: opera, Bench002: immortal }
+const redisSocket = process.env.BENCH_REDIS_SOCKET
+const command = async (...args: string[]) => {
+  const { stdout } = await promisify(execFile)(process.env.CM_REDIS_CLI ?? 'redis-cli', ['-s', redisSocket!, '--json', ...args])
+  return JSON.parse(stdout)
+}
+const redis = redisSocket ? {
+  get: (key: string) => command('GET', key),
+  eval: (script: string, keys: string[], args: unknown[]) =>
+    command('EVAL', script, String(keys.length), ...keys, ...args.map(String)),
+} as Pick<Redis, 'eval' | 'get'> : undefined
 const modes = ['quick', 'standard'] as const
 for (const mode of modes) {
   const records = Object.fromEntries(Object.entries(fixtures).map(([id, pgn]) => [id, mode === 'quick' ? pgn : ending(pgn, 4)]))
   const handle = engineHandler({
-    admission: sampleAdmission(), enabled: () => true,
+    admission: redis ? new RedisAdmission(redis, 'loopback-benchmark') : sampleAdmission(), enabled: () => true,
     request: async input => {
       const id = new URL(String(input)).pathname.split('/').at(-1)!
       return Response.json({ id, variant: 'standard', status: 'mate', pgn: records[id] })
@@ -39,9 +52,11 @@ for (const mode of modes) {
       const request = await cloudRequest(pgn, mode, id)
       const body = await request.text()
       const started = performance.now()
-      const reply = await fetch('http://127.0.0.1:' + address.port + '/api/engine/analyze', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+      const send = () => fetch('http://127.0.0.1:' + address.port + '/api/engine/analyze', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Vercel-Forwarded-For': '192.0.2.22',
+          'X-ChessMind-Session': crypto.randomUUID() }, body,
       })
+      const reply = await send()
       const ttfbMs = performance.now() - started
       const reader = reply.body!.getReader()
       const decoder = new TextDecoder()
@@ -69,8 +84,12 @@ for (const mode of modes) {
         return { accuracy: arithmetic === null ? null : (arithmetic + harmonic) / 2,
           acpl: average(scored.flatMap((review: { cpLoss: number | null }) => review.cpLoss === null ? [] : [review.cpLoss])) }
       })
+      const elapsedMs = performance.now() - started
+      const cacheStart = performance.now()
+      const repeat = await send()
+      const first = JSON.parse((await repeat.text()).split('\n')[0])
       console.log(JSON.stringify({ name: id === 'Bench001' ? 'Morphy' : 'Anderssen', mode, outcome: final?.type,
-        previewMs, elapsedMs: performance.now() - started, ttfbMs, ...final?.metrics, summary,
+        previewMs, elapsedMs, ttfbMs, cachedMs: first.cached ? performance.now() - cacheStart : undefined, ...final?.metrics, summary,
         depths: reviews.map((review: { depth: number }) => review.depth) }))
     }
   } finally { server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())) }

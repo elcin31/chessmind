@@ -1,5 +1,5 @@
 import { Chess, SQUARES, type Color, type Move, type Square } from 'chess.js'
-import { evalLabel, material, pieceValue, sacrifice, variation, type Line, type Phase } from './review'
+import { evalLabel, material, pieceValue, sacrifice, variation, type Line, type Phase } from './review.js'
 
 const pieces = { p: 'пешка', n: 'конь', b: 'слон', r: 'ладья', q: 'ферзь', k: 'король' }
 const enemy = (color: Color): Color => color === 'w' ? 'b' : 'w'

@@ -2,7 +2,7 @@ import { createRoot } from 'react-dom/client'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_POSITION } from 'chess.js'
 import { Activity, ArrowDownToLine, ArrowRight, BookOpen, ChartNoAxesCombined, CircleHelp, Cpu, FolderOpen, House, List, MonitorDown, Settings2, ShieldCheck, Target, Upload, Zap } from 'lucide-react'
-import { analyzeInCloud, chooseCompute, cloudBlocker, getCloudStatus, useCloudStatus } from './cloudClient'
+import { analyzeInCloud, chooseCompute, CloudUnavailable, cloudBlocker, cloudState, getCloudStatus, useCloudStatus } from './cloudClient'
 import { ComputeSelect } from './ComputeSettings'
 import { cloudOptions, type ComputeEngine, type ComputeSource, type Energy } from './cloudProtocol'
 import { updateLiveReview, updateProgress } from './AnalysisProgress'
@@ -138,8 +138,6 @@ function App() {
       if (!latest) return
       const { id, queuedAt } = latest
       const compute = !automatic && latest.compute === 'cloud' ? 'cloud' : 'local'
-      const started = performance.now()
-      const resumedLocal = !!latest.reviews?.length || !!Object.keys(latest.draft?.work?.reviews ?? {}).length
       let staged: Draft | undefined
       let status: StageProgress | undefined
       let telemetry: PoolStatus | undefined
@@ -162,7 +160,7 @@ function App() {
         const eta = processed >= 2 ? Math.ceil((now - stageStart) * (total - step) / (1000 * processed)) : undefined
         updateProgress({ id, ...status, automatic, compute, search: telemetry, eta })
       }
-      const persist = (final?: { draft: Draft; reviews?: Review[] }) => {
+      const persist = (final?: { draft: Draft; reviews?: Review[]; cached?: boolean }) => {
         if (!staged || !status) return saving
         const stamp = [status.stage, status.instant, status.checked].join(':')
         if (!final && stamp === persisted) return saving
@@ -180,8 +178,7 @@ function App() {
             const completedDraft = final?.reviews && !finished ? checkpoint : draft
             const field = compute === 'cloud' ? 'cloudDraft' : 'draft'
             const updated = { ...record, [field]: unchanged ? completedDraft : { ...completedDraft, work: record[field]?.work },
-              ...(finished ? { reviews: final.reviews, queued: false,
-                ...(compute === 'local' && !resumedLocal ? { localElapsedMs: performance.now() - started } : {}) } : {}) }
+              ...(finished ? { reviews: final.reviews, queued: false, cloudCacheHit: final.cached === true } : {}) }
             await tx.store.put(updated)
             await tx.done
             if (final) mergeGame(updated)
@@ -215,12 +212,21 @@ function App() {
         await persist(result)
       } catch (error) {
         if (!controller.signal.aborted) {
-          setStatus(error instanceof Error ? error.message : 'Ошибка анализа.')
-          if (automatic) await patchGame(id, { autoPreviewPaused: true })
-          else {
-            const latest = await (await db).get('games', id)
-            if (latest?.queuedAt === queuedAt) await patchGame(id, { queued: false })
+          await persist()
+          const tx = (await db).transaction('games', 'readwrite')
+          const record = await tx.store.get(id)
+          if (record && record.queuedAt === queuedAt) {
+            if (!automatic && compute === 'cloud' && record.queueSource === 'auto' && error instanceof CloudUnavailable) {
+              const update = { ...record, ...prepareAnalysis(record, record.mode ?? settings.mode, settings.engine),
+                queuedAt: Math.max(Date.now(), (queuedAt ?? 0) + 1), draft: reuseInstant(record) }
+              if (isComplete(update)) update.queued = false
+              await tx.store.put(update)
+            } else {
+              setStatus(error instanceof Error ? error.message : 'Ошибка анализа.')
+              await tx.store.put(automatic ? { ...record, autoPreviewPaused: true } : { ...record, queued: false })
+            }
           }
+          await tx.done
         }
       } finally {
         await persist()
@@ -242,12 +248,10 @@ function App() {
     setStatus('')
     const status = source === 'local' ? undefined : await getCloudStatus()
     const selections = new Map<string, ComputeEngine>()
-    const calibration = games.find(item => item.compute !== 'cloud' && item.mode === mode && isComplete(item) && item.localElapsedMs && item.moves)
     for (const game of items) {
       const issue = source === 'cloud' && cloudBlocker(game, mode, status)
       if (issue) { setStatus(issue); continue }
-      const localSeconds = calibration ? calibration.localElapsedMs! * game.moves / (1000 * calibration.moves) : undefined
-      selections.set(game.id, chooseCompute(source, game, mode, status, localSeconds))
+      selections.set(game.id, chooseCompute(source, game, mode, status))
     }
     if (!selections.size) return
     const running = current.current
@@ -291,7 +295,7 @@ function App() {
       <a href="#home" className="brand"><img src="/icon.svg" width="43" height="43" alt="" /><div>Chess<span>Mind</span><small>АНАЛИЗ ПАРТИЙ</small></div></a>
       <nav aria-label="Основные разделы" className="main-nav">{navigation(core)}</nav>
       <nav aria-label="Дополнительные разделы" className="secondary-nav">{navigation(secondary)}</nav>
-      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0.3</small></div>
+      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0.4</small></div>
     </aside>
     <main>
       <header className="topbar">
@@ -319,7 +323,7 @@ function App() {
         }}>Обновить</button></div>}
         {location.page === 'home' && <>
           <section className="hero">
-            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0.3</div>
+            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0.4</div>
               <h1>Разбор шахматных<br className="desktop-break" /> партий</h1>
               <p>Найдите переломные ходы, проверьте варианты Stockfish и потренируйтесь на собственных ошибках.</p>
               <div className="hero-actions"><a className="primary" href="#games"><ArrowDownToLine size={18} /> Добавить партию</a>
@@ -560,7 +564,7 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
       <label className="field">Источник вычислений<ComputeSelect value={settings.computeSource ?? 'local'}
         onChange={computeSource => onSettings({ ...settings, computeSource })} /></label>
       <p className="muted">На устройстве анализ доступен офлайн. Облако экономит заряд и использует выделенную квоту. Автоматический режим учитывает доступность, режим разбора и скорость устройства.</p>
-      <p className="muted">{cloud?.available ? 'Облачный анализ доступен для Express и Standard.' : cloudBlocker(undefined, 'quick', cloud)}</p>
+      <p className="muted">{cloudBlocker(undefined, 'quick', cloud) ?? cloudState(cloud)}</p>
       <label className="field">Энергопотребление<select value={settings.engine?.energy ?? 'balanced'} onChange={event => onSettings({
         ...settings, engine: { ...settings.engine, energy: event.target.value as Energy },
       })}><option value="eco">Eco</option><option value="balanced">Balanced</option><option value="turbo">Turbo</option></select></label>

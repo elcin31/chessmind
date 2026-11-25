@@ -1,6 +1,6 @@
-import { deviceConfiguration, Engine, type SearchSpeed } from './engine'
-import type { EngineOptions } from './library'
-import type { Line } from './review'
+import { deviceConfiguration, Engine, type SearchSpeed } from './engine.js'
+import type { EngineOptions } from './library.js'
+import type { Line } from './review.js'
 
 type Request = Parameters<Engine['evaluate']>
 export type PoolStatus = { workers: number; threads: number; depth?: number; nps: number }

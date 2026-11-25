@@ -1,24 +1,18 @@
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { cloudEngine, cloudLimits, cloudOptions, gameFingerprint, type CloudMode, type CloudStatus, type GameReference } from '../../src/cloudProtocol'
-import { readGame, type Opening } from '../../src/game'
-import { analyzeProgressively } from '../../src/progressive'
-import { ServerStockfish } from './stockfish'
-import { officialPgn, readText, RequestFailure } from './verification'
-
-type BudgetSnapshot = { remainingCpuMs: number; busy: boolean }
-type Permit = { release(): Promise<void> }
-export type Admission = {
-  status(): Promise<BudgetSnapshot>
-  // Atomically debit the full reservation and lock the job id and global
-  // concurrency. Keep the debit and replay entry even if the job is cancelled.
-  reserve(key: string, cpuMs: number): Promise<Permit | 'duplicate' | 'quota' | 'busy'>
-}
+import { cloudEngine, cloudLimits, cloudOptions, gameFingerprint, type CloudMode, type CloudStatus, type GameReference } from '../../src/cloudProtocol.js'
+import { methodologyVersion, readGame, type Game, type Opening } from '../../src/game.js'
+import { analyzeProgressively } from '../../src/progressive.js'
+import { ServerStockfish } from './stockfish.js'
+import { officialPgn, readText, RequestFailure } from './verification.js'
+import { analysisCacheKey, type Admission, type CloudResult, type Permit } from './quota.js'
 
 const disabled: CloudStatus = { available: false, reason: 'quota_guard_unavailable', modes: ['quick', 'standard'], engine: cloudEngine }
 const json = (body: object, status = 200) =>
   Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } })
 const fail = (status: number, code: string, message: string) => json({ code, message }, status)
+const streamHeaders = { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store' }
+const intakeDenied = () => fail(429, 'rate', 'Слишком много запросов. Повторите позже или продолжите на устройстве.')
 const validMonth = /^20\d\d-(0[1-9]|1[0-2])$/
 const object = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x)
 const keys = (value: object, list: string[]) => Object.keys(value).length === list.length && list.every(key => Object.hasOwn(value, key))
@@ -41,7 +35,6 @@ function input(value: unknown): { reference: GameReference; fingerprint: string;
   }
   throw new RequestFailure(400, 'invalid', 'Неверная ссылка на партию.')
 }
-
 let book: Record<string, true | Opening> | undefined
 async function loadBook() {
   return book ??= JSON.parse(await readFile(resolve('public/eco.json'), 'utf8'))
@@ -57,23 +50,28 @@ type Dependencies = {
 export function engineHandler(deps: Dependencies = {}) {
   const enabled = deps.enabled ?? (() => process.env.CHESSMIND_CLOUD_ENABLED === '1')
   return async (request: Request) => {
-    const path = new URL(request.url).pathname
+    const url = new URL(request.url)
+    const path = url.pathname
     const gate = deps.admission
-    if (path === '/api/engine/status' && request.method === 'GET') {
+    if (path === '/api/engine/status' && (request.method === 'GET' || request.method === 'HEAD')) {
+      if (url.search) return fail(400, 'invalid', 'Статус не принимает параметры.')
       if (!gate) return json(disabled)
       if (!enabled()) return json({ ...disabled, reason: 'disabled' })
       try {
         const state = await gate.status()
-        const available = state.remainingCpuMs >= cloudLimits.reservationCpuMs
-        return json({ available, reason: available ? undefined : 'quota', ...state, modes: disabled.modes, engine: cloudEngine,
-          estimateSeconds: { quick: 8, standard: 18 } })
-      } catch { return json(disabled) }
+        const available = !state.intakeClosed && state.remainingCpuMs >= cloudLimits.reservationCpuMs
+        return Response.json({ ...disabled, available, reason: available ? undefined : state.intakeClosed ? 'rate' : 'quota',
+          cacheAvailable: !state.intakeClosed, remainingCpuMs: state.remainingCpuMs, busy: state.busy },
+        { headers: { 'Cache-Control': 'no-cache', 'Vercel-CDN-Cache-Control': 'public, s-maxage=50' } })
+      } catch { return json({ ...disabled, reason: 'unavailable' }) }
     }
     if (path !== '/api/engine/analyze') return fail(404, 'not_found', 'Маршрут недоступен.')
     if (request.method !== 'POST') return fail(405, 'method', 'Используйте POST.')
     if (!gate || !enabled()) return fail(503, !gate ? 'quota_guard_unavailable' : 'disabled', 'Облачный анализ временно недоступен.')
     const origin = request.headers.get('origin')
-    if (origin && origin !== new URL(request.url).origin) return fail(403, 'origin', 'Запрос с другого сайта отклонён.')
+    if (url.search || request.headers.get('sec-fetch-site') === 'cross-site' || origin && origin !== url.origin) {
+      return fail(403, 'origin', 'Запрос отклонён.')
+    }
     if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return fail(415, 'type', 'Требуется JSON.')
     if (Number(request.headers.get('content-length')) > cloudLimits.requestBytes) return fail(413, 'size', 'Запрос превышает лимит размера.')
 
@@ -85,19 +83,35 @@ export function engineHandler(deps: Dependencies = {}) {
     try {
       const query = input(JSON.parse(await readText(request.body, cloudLimits.requestBytes, signal)))
       signal.throwIfAborted()
-      const reserved = await gate.reserve([query.reference.platform, query.reference.id, query.mode].join(':'), cloudLimits.reservationCpuMs)
-      if (typeof reserved === 'string') return fail(429, reserved, reserved === 'quota' ? 'Облачный лимит исчерпан.' :
-        reserved === 'duplicate' ? 'Эта партия уже запрашивалась в выбранном режиме.' : 'Облачный движок занят.')
-      permit = reserved
+      const caller = await gate.preflight(request)
+      if (caller === 'invalid') return fail(400, 'session', 'Обновите страницу для запуска облачного анализа.')
+      if (caller === 'rate') return intakeDenied()
+      signal.throwIfAborted()
 
       const pgn = await officialPgn(query.reference, signal, deps.request)
-      let game
+      let game: Game
       try { game = await readGame(pgn, deps.loadBook ?? loadBook, query.reference.platform) }
       catch { throw new RequestFailure(422, 'illegal', 'Запись партии не прошла проверку шахматных правил.') }
       if (game.moves > cloudLimits.plies[query.mode]) throw new RequestFailure(422, 'plies', 'Партия слишком длинная для этого облачного режима.')
       if (await gameFingerprint(game) !== query.fingerprint) throw new RequestFailure(422, 'mismatch', 'Партия в архиве отличается от записи на устройстве.')
       const options = cloudOptions
-      game = { ...game, mode: query.mode, options, methodology: 2 as const, compute: 'cloud' as const }
+      const start = { type: 'start', fingerprint: query.fingerprint, engine: cloudEngine, mode: query.mode, options }
+      const fromCache = (result: CloudResult) => new Response(
+        JSON.stringify({ ...start, cached: true }) + '\n' + JSON.stringify({ type: 'done', ...result }) + '\n',
+        { headers: streamHeaders },
+      )
+      const key = analysisCacheKey(query.fingerprint, query.mode, game.book)
+      const cached = await gate.lookup(key)
+      signal.throwIfAborted()
+      if (cached) return fromCache(cached)
+      const reserved = await gate.reserve(key, cloudLimits.reservationCpuMs, caller)
+      if (reserved === 'rate') return intakeDenied()
+      if (typeof reserved === 'string') return fail(429, reserved, reserved === 'quota' ? 'Облачный лимит исчерпан.' :
+        reserved === 'duplicate' ? 'Эта партия недавно запрашивалась в выбранном режиме.' : 'Облачный движок занят.')
+      if ('cached' in reserved) return fromCache(reserved.cached)
+      permit = reserved
+      signal.throwIfAborted()
+      game = { ...game, mode: query.mode, options, methodology: methodologyVersion, compute: 'cloud' as const }
 
       const release = permit
       permit = undefined
@@ -134,7 +148,7 @@ export function engineHandler(deps: Dependencies = {}) {
             let last = -Infinity
             let stage = ''
             try {
-              send({ type: 'start', fingerprint: query.fingerprint, engine: cloudEngine, mode: query.mode, options })
+              send(start)
               const result = await analyzeProgressively(game, query.mode, signal, async (draft, progress) => {
                 const now = performance.now()
                 if (stage !== progress.stage || now - last >= 180 || progress.instant === progress.moves + 1 && progress.stage === 'instant') {
@@ -146,8 +160,13 @@ export function engineHandler(deps: Dependencies = {}) {
                 engine = new ServerStockfish(signal, settings, sample => send({ type: 'telemetry', sample }))
                 return engine
               })
+              const used = await cpu()
+              if (used >= cloudLimits.jobCpuMs) stop.abort(new DOMException('CPU budget', 'TimeoutError'))
+              signal.throwIfAborted()
+              clearInterval(meter)
+              await release.save(result).catch(() => {})
               send({ type: 'done', ...result, metrics: {
-                cpuMs: await cpu(), wallMs: performance.now() - started, searches: engine?.searches ?? 0,
+                cpuMs: used, wallMs: performance.now() - started, searches: engine?.searches ?? 0,
                 nodes: engine?.nodes ?? 0, engineBootMs: engine?.bootMs ?? 0, rssKiB: process.memoryUsage.rss() / 1024,
               } })
             } catch {
@@ -166,7 +185,7 @@ export function engineHandler(deps: Dependencies = {}) {
         },
         cancel() { stop.abort() },
       })
-      return new Response(stream, { headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store' } })
+      return new Response(stream, { headers: streamHeaders })
     } catch (error) {
       if (error instanceof RequestFailure) return fail(error.status, error.code, error.message)
       if (error instanceof SyntaxError || error instanceof TypeError) return fail(400, 'invalid', 'Некорректный JSON.')
@@ -175,8 +194,3 @@ export function engineHandler(deps: Dependencies = {}) {
     } finally { await permit?.release().catch(() => {}) }
   }
 }
-
-// This Web Standard entry point can be deployed as a Node.js Function once the
-// project has an atomic global admission provider. Production routing currently
-// serves a static status document and rejects the compute path at the edge.
-export default { fetch: engineHandler() }

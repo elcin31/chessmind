@@ -1,8 +1,8 @@
 import { Chess, type Color, type Move } from 'chess.js'
-import type { ComputeEngine, ComputeSource, Energy } from './cloudProtocol'
-import type { Draft } from './progressive'
-import type { Review } from './review'
-import { drawState } from './rules'
+import type { ComputeEngine, ComputeSource, Energy } from './cloudProtocol.js'
+import type { Draft } from './progressive.js'
+import type { Review } from './review.js'
+import { drawState } from './rules.js'
 
 export type Source = 'chesscom' | 'lichess' | 'pgn'
 export type Opening = [eco: string, name: string, pgn: string]
@@ -19,7 +19,7 @@ export type Game = {
   id: string; pgn: string; initial: string; source: Source; url?: string; owner?: string;
   white: string; black: string; whiteElo?: number; blackElo?: number;
   date: string; timestamp?: number; result: string; time: string; opening?: Opening; book: number;
-  moves: number; mode?: Mode; reviews?: Review[]; queued?: boolean; queuedAt?: number; methodology?: 1 | 2; options?: EngineOptions; savedAnalyses?: Analysis[]; draft?: Draft; cloudDraft?: Draft; localElapsedMs?: number; queueSource?: ComputeSource; compute?: ComputeEngine; autoPreviewPaused?: boolean
+  moves: number; mode?: Mode; reviews?: Review[]; queued?: boolean; queuedAt?: number; methodology?: 1 | 2; options?: EngineOptions; savedAnalyses?: Analysis[]; draft?: Draft; cloudDraft?: Draft; cloudCacheHit?: boolean; localElapsedMs?: number; queueSource?: ComputeSource; compute?: ComputeEngine; autoPreviewPaused?: boolean
 }
 export const uci = (move: Move) => move.from + move.to + (move.promotion ?? '')
 export const fenKey = (fen: string) => fen.split(' ').slice(0, 4).join(' ')

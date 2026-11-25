@@ -1,9 +1,9 @@
 import { Worker } from 'node:worker_threads'
-import type { EngineOptions, Mode } from '../../src/game'
-import type { Line } from '../../src/review'
-import { collectLines, searchParameters, type Position } from '../../src/stockfish'
-import type { PoolStatus } from '../../src/searchPool'
-import { cloudEngine } from '../../src/cloudProtocol'
+import type { EngineOptions, Mode } from '../../src/game.js'
+import type { Line } from '../../src/review.js'
+import { collectLines, searchParameters, type Position } from '../../src/stockfish.js'
+import type { PoolStatus } from '../../src/searchPool.js'
+import { cloudEngine } from '../../src/cloudProtocol.js'
 
 export class ServerStockfish {
   private worker?: Worker
@@ -18,9 +18,16 @@ export class ServerStockfish {
   constructor(private signal: AbortSignal, private options: EngineOptions, private report: (sample: PoolStatus) => void) {}
 
   async cpuMs() {
-    if (!this.worker) return 0
-    const { user, system } = await this.worker.cpuUsage()
-    return (user + system) / 1000
+    const worker = this.worker
+    if (!worker) return 0
+    try {
+      const { user, system } = await worker.cpuUsage()
+      return (user + system) / 1000
+    } catch (error) {
+      // Startup/termination can race this sample. The process counter includes the thread.
+      if (worker !== this.worker || (error as NodeJS.ErrnoException).code === 'ERR_WORKER_NOT_RUNNING') return 0
+      throw error
+    }
   }
 
   private exchange(commands: string[], done: string, receive?: (line: string) => void) {

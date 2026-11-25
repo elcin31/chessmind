@@ -1,11 +1,11 @@
-import { gameMoves, uci, type Game, type Mode } from './game'
+import { gameMoves, uci, type Game, type Mode } from './game.js'
 
 export type ComputeSource = 'local' | 'cloud' | 'auto'
 export type ComputeEngine = Exclude<ComputeSource, 'auto'>
 export type Energy = 'eco' | 'balanced' | 'turbo'
 export type CloudMode = 'quick' | 'standard'
 
-export { cloudEngine } from './game'
+export { cloudEngine } from './game.js'
 export const cloudLimits = {
   jobCpuMs: 20_000, reservationCpuMs: 30_000, jobWallMs: 25_000, monthCpuMs: 3_600_000,
   jobsPerMonth: 120, concurrent: 1, requestBytes: 1024, pgnBytes: 48 * 1024,
@@ -13,9 +13,8 @@ export const cloudLimits = {
 } as const
 
 export type CloudStatus = {
-  available: boolean; reason?: 'quota_guard_unavailable' | 'disabled' | 'quota' | 'network' | 'offline';
-  remainingCpuMs?: number; busy?: boolean; modes?: CloudMode[]; engine?: string;
-  estimateSeconds?: Partial<Record<CloudMode, number>>
+  available: boolean; reason?: 'quota_guard_unavailable' | 'disabled' | 'unavailable' | 'quota' | 'rate' | 'network' | 'offline';
+  remainingCpuMs?: number; busy?: boolean; cacheAvailable?: boolean; modes?: CloudMode[]; engine?: string;
 }
 
 export type GameReference =

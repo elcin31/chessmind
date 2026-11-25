@@ -1,9 +1,9 @@
 import { Chess, type Square } from 'chess.js'
-import { analysisKey, gameMoves, uci, type Game, type Mode } from './game'
-import { analyzeMove, expectation, moveAccuracy, positionsFor, sacrifice, type Line, type Review } from './review'
-import type { PoolStatus } from './searchPool'
-import type { EngineOptions } from './game'
-import type { Engine } from './engine'
+import { analysisKey, gameMoves, uci, type Game, type Mode } from './game.js'
+import { analyzeMove, expectation, moveAccuracy, positionsFor, sacrifice, type Line, type Review } from './review.js'
+import type { PoolStatus } from './searchPool.js'
+import type { EngineOptions } from './game.js'
+import type { Engine } from './engine.js'
 
 export const stageLabels = {
   instant: 'Предварительный разбор',
@@ -123,7 +123,7 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
   const options = game.options ?? {}
   const previewOptions = { ...options, full: false }
   const makePool = createPool ?? (async (config: EngineOptions) => {
-    const { SearchPool, poolConfiguration } = await import('./searchPool')
+    const { SearchPool, poolConfiguration } = await import('./searchPool.js')
     return new SearchPool(signal, game.id, config, await poolConfiguration(config), telemetry)
   })
   let pool = await makePool(previewOptions)

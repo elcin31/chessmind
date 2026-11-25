@@ -50,7 +50,7 @@ export function AnalysisProgress({ id, initial, checked, total, running, queued 
       <span>{rate}%</span>
     </div>
     <div className="analysis-counts">
-      {live && <span>{live.compute === 'cloud' ? 'Облако' : 'На устройстве'}</span>}
+      {live && <span>{live.compute === 'cloud' ? 'Облачный анализ' : 'На устройстве'}</span>}
       <span>Позиции {prepared}/{total + 1}</span>
       {live && live.critical > 0 && <span>Критические {live.criticalDone}/{live.critical}</span>}
       {!live?.automatic && <span>Проверено ходов {finalCount}/{total}</span>}

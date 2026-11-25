@@ -1,9 +1,9 @@
-import { db, type Mode, type EngineOptions } from './library'
-import type { Line } from './review'
+import { db, type Mode, type EngineOptions } from './library.js'
+import type { Line } from './review.js'
 
-import { collectLines, searchParameters, type Position } from './stockfish'
-export { budgets } from './stockfish'
-export type { Position } from './stockfish'
+import { collectLines, searchParameters, type Position } from './stockfish.js'
+export { budgets } from './stockfish.js'
+export type { Position } from './stockfish.js'
 
 export type SearchSpeed = { depth: number; nps: number; engine: string }
 type Configuration = { full: boolean; threads: 1 | 2; hash: number; saving?: boolean }

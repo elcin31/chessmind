@@ -13,7 +13,7 @@ export function getCloudStatus(force = false): Promise<CloudStatus> {
   if (!navigator.onLine) return Promise.resolve(offline)
   if (!force && currentStatus && Date.now() - checkedAt < 8000) return currentStatus
   checkedAt = Date.now()
-  currentStatus = fetch('/api/engine/status', { cache: 'no-store', signal: AbortSignal.timeout(3500) })
+  currentStatus = fetch('/api/engine/status', { signal: AbortSignal.timeout(3500) })
     .then(async response => {
       if (!response.ok) throw new Error()
       const value: CloudStatus = await response.json()
@@ -48,32 +48,47 @@ export function cloudBlocker(game: Game | undefined, mode: Mode, status: CloudSt
   if (game && !referenceFor(game)) return 'Для облака нужна партия из официального архива Chess.com или Lichess.'
   if (game && game.moves > cloudLimits.plies[mode]) return 'Облачный лимит для этого режима — ' + cloudLimits.plies[mode] + ' полуходов.'
   if (!status) return 'Проверяем доступность облака…'
-  if (!status.available) {
+  if (!status.available && !status.cacheAvailable) {
     switch (status.reason) {
-      case 'quota_guard_unavailable': return 'Облако отключено для защиты общей квоты Vercel.'
+      case 'quota_guard_unavailable': return 'Облачный анализ ожидает подключения Redis.'
       case 'quota': return 'Облачный лимит исчерпан.'
+      case 'rate': return 'Дневной лимит запросов к облаку исчерпан.'
       case 'offline': return 'Сейчас доступен анализ на устройстве.'
       case 'network': return 'Не удалось связаться с облачным движком.'
+      case 'unavailable': return 'Облако временно недоступно.'
       default: return 'Облачный анализ выключен.'
     }
   }
-  if (status.busy) return 'Облачный движок занят.'
   if (status.engine !== cloudEngine || !status.modes?.includes(mode)) return 'Этот режим доступен на устройстве.'
-  if ((status.remainingCpuMs ?? 0) < cloudLimits.reservationCpuMs) return 'Облачный лимит исчерпан.'
 }
 
-export function chooseCompute(source: ComputeSource, game: Game, mode: Mode, status: CloudStatus | undefined, localSeconds?: number): ComputeEngine {
-  if (source === 'local' || cloudBlocker(game, mode, status)) return 'local'
-  if (source === 'cloud') return 'cloud'
-  const device = navigator as Navigator & { deviceMemory?: number }
-  const slow = (device.hardwareConcurrency || 2) <= 4 || (device.deviceMemory ?? 8) <= 4
-  const seconds = localSeconds ?? game.moves * (mode === 'quick' ? .16 : .7) * (slow ? 3 : 1)
-  const estimate = supportedCloudMode(mode) ? status?.estimateSeconds?.[mode] : undefined
-  return estimate && seconds >= estimate * 1.25 ? 'cloud' : 'local'
+export function cloudState(status: CloudStatus | undefined) {
+  if (status?.reason === 'quota') return 'Облачный лимит исчерпан. Доступны результаты из кэша.'
+  if (status?.busy) return 'Сервер занят. Доступны результаты из кэша.'
+  return 'Облачный движок доступен.'
+}
+
+export function chooseCompute(source: ComputeSource, game: Game, mode: Mode, status: CloudStatus | undefined): ComputeEngine {
+  return source !== 'local' && !cloudBlocker(game, mode, status) ? 'cloud' : 'local'
+}
+
+export class CloudUnavailable extends Error {}
+
+let session: string | undefined
+function anonymousSession() {
+  if (session) return session
+  const key = 'chessmind-cloud-session'
+  try {
+    const value = localStorage.getItem(key)
+    if (value && /^[a-f0-9-]{36}$/i.test(value)) return session = value
+    session = crypto.randomUUID()
+    localStorage.setItem(key, session)
+  } catch { session ??= crypto.randomUUID() }
+  return session
 }
 
 type StreamEvent =
-  | { type: 'start'; fingerprint: string; mode: string; engine: string; options: { threads: number; hash: number } }
+  | { type: 'start'; fingerprint: string; mode: string; engine: string; options: { threads: number; hash: number }; cached?: boolean }
   | { type: 'progress'; draft: Draft; progress: StageProgress }
   | { type: 'telemetry'; sample: PoolStatus }
   | { type: 'done'; draft: Draft; reviews: Review[] }
@@ -114,7 +129,7 @@ export async function analyzeInCloud(game: Game, mode: Mode, signal: AbortSignal
   let response: Response
   try {
     response = await fetch('/api/engine/analyze', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-ChessMind-Session': anonymousSession() },
       body: JSON.stringify({ reference, fingerprint, mode }),
       signal: AbortSignal.any([signal, AbortSignal.timeout(35_000)]),
     })
@@ -124,6 +139,9 @@ export async function analyzeInCloud(game: Game, mode: Mode, signal: AbortSignal
   }
   if (!response.ok) {
     const error: { message?: string } = await response.json().catch(() => ({}))
+    if ([400, 404, 422, 429, 503].includes(response.status)) {
+      throw new CloudUnavailable(error.message ?? 'Облачный анализ недоступен.')
+    }
     throw new Error(error.message ?? 'Облачный анализ недоступен. Продолжите на устройстве.')
   }
   if (!response.body || !response.headers.get('content-type')?.startsWith('application/x-ndjson')) throw new Error('Облако вернуло неверный ответ.')
@@ -131,6 +149,7 @@ export async function analyzeInCloud(game: Game, mode: Mode, signal: AbortSignal
   const decode = new TextDecoder()
   let pending = ''
   let started = false
+  let cached = false
   let delivered = false
   let result: { draft: Draft; reviews: Review[] } | undefined
   try {
@@ -152,6 +171,7 @@ export async function analyzeInCloud(game: Game, mode: Mode, signal: AbortSignal
             throw new Error('Параметры облачного ответа не совпали с запросом.')
           }
           started = true
+          cached = event.cached === true
           continue
         }
         if (event.type === 'error') throw new Error(event.message)
@@ -174,7 +194,7 @@ export async function analyzeInCloud(game: Game, mode: Mode, signal: AbortSignal
     if (!result) throw new Error('Связь с облаком прервалась. Готовые позиции сохранены.')
     if (!delivered) await update(result.draft, { stage: 'final', instant: game.moves + 1, checked: game.moves,
       critical: 0, criticalDone: 0, moves: game.moves })
-    return result
+    return { ...result, cached }
   } finally {
     await reader.cancel().catch(() => {})
     reader.releaseLock()

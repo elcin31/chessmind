@@ -1,10 +1,11 @@
 import { test, expect } from '@playwright/test'
 import { cloudEngine } from '../src/cloudProtocol'
+import { ending } from './cloudFixtures'
 import { opera } from './fixtures'
 
 test('облако выключено, автоматический выбор работает офлайн, настройки сохраняются', async ({ page, context }) => {
   await page.goto('/#settings')
-  await expect(page.getByText('Облако отключено для защиты общей квоты Vercel.')).toBeVisible()
+  await expect(page.getByText('Облачный анализ ожидает подключения Redis.')).toBeVisible()
   await expect(page.getByText('Офлайн готов')).toBeVisible({ timeout: 30_000 })
   const source = page.getByRole('combobox', { name: 'Источник вычислений' })
   await expect(source).toHaveValue('local')
@@ -30,6 +31,35 @@ test('облако выключено, автоматический выбор �
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByText('Анализ завершён · На устройстве')).toBeVisible({ timeout: 50_000 })
   expect(calls).toEqual([])
+})
+
+test('автоматический выбор проверяет облачный кэш и при ответе 429 запускает локальный анализ', async ({ page }) => {
+  const archive = 'https://api.chess.com/pub/player/morphy/games/2024/05'
+  const headers = { 'access-control-allow-origin': '*' }
+  await page.route('https://api.chess.com/pub/player/morphy/games/archives', route =>
+    route.fulfill({ headers, json: { archives: [archive] } }))
+  await page.route(archive, route => route.fulfill({ headers, json: { games: [{
+    pgn: ending(opera, 4).replace('1858.01.01', '2024.05.01'), rules: 'chess', url: 'https://www.chess.com/game/live/12345',
+  }] } }))
+  await page.route('**/api/engine/status', route => route.fulfill({ json: {
+    available: false, reason: 'quota', cacheAvailable: true, engine: cloudEngine, modes: ['quick', 'standard'], remainingCpuMs: 0,
+  } }))
+  let requests = 0
+  await page.route('**/api/engine/analyze', route => {
+    requests++
+    expect(route.request().headers()['x-chessmind-session']).toMatch(/^[a-f0-9-]{36}$/)
+    return route.fulfill({ status: 429, json: { code: 'quota', message: 'Облачный лимит исчерпан.' } })
+  })
+  await page.goto('/#games')
+  await page.getByRole('textbox', { name: /Никнейм на Chess.com/ }).fill('morphy')
+  await page.getByRole('button', { name: 'Импортировать историю' }).click()
+  await page.getByRole('button', { name: /Morphy – Duke/ }).click()
+  await page.getByRole('combobox', { name: 'Источник вычислений' }).selectOption('auto')
+  await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption('quick')
+  await expect(page.getByText('Облачный лимит исчерпан. Доступны результаты из кэша.')).toBeVisible()
+  await page.getByRole('button', { name: 'Начать анализ' }).click()
+  await expect(page.getByText('Анализ завершён · На устройстве')).toBeVisible({ timeout: 30_000 })
+  expect(requests).toBe(1)
 })
 
 test('оборванный поток сохраняется, облачный лимит обработан, продолжение локально', async ({ page }) => {
