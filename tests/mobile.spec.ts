@@ -44,6 +44,44 @@ test.describe('Android Chrome', () => {
     await expect(page.getByRole('button', { name: 'Анализ готов' })).toBeVisible()
   })
 
+  test('Android Balanced ограничивает суммарный параллелизм даже при 8 ГиБ памяти', async ({ page }) => {
+    let running = 0
+    let peak = 0
+    const commands: string[] = []
+    await page.exposeFunction('recordAndroidSearch', (message: string) => {
+      commands.push(message)
+      if (message.startsWith('go ')) peak = Math.max(peak, ++running)
+      if (message === 'bestmove') running--
+    })
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'deviceMemory', { value: 8 })
+      Object.defineProperty(navigator, 'hardwareConcurrency', { value: 8 })
+      localStorage.setItem('chessmind-mobile-local-warning', '1')
+      localStorage.setItem('chessmind-settings', JSON.stringify({ engine: { energy: 'balanced', workers: 4 }, computeSource: 'local' }))
+      const original = Worker.prototype.postMessage
+      const seen = new WeakSet()
+      const report = (message: string) => void (window as any).recordAndroidSearch(message)
+      Worker.prototype.postMessage = function (payload: unknown, ...options: []) {
+        if (typeof payload === 'string') {
+          if (!seen.has(this)) {
+            seen.add(this)
+            this.addEventListener('message', event => {
+              if (typeof event.data === 'string' && /^bestmove /m.test(event.data)) report('bestmove')
+            })
+          }
+          report(payload)
+        }
+        return original.call(this, payload, ...options)
+      }
+    })
+    await importGames(page, ending(opera, 12))
+    await page.getByRole('button', { name: 'Начать анализ' }).click()
+    await expect(page.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 60_000 })
+    expect(peak).toBe(1)
+    expect(commands).toContain('setoption name Hash value 16')
+    expect(commands.some(command => /setoption name Threads value 2/.test(command))).toBe(false)
+  })
+
   test('предел времени оставляет черновик и требует ручного продолжения', async ({ page }) => {
     await page.addInitScript(() => {
       const original = Worker.prototype.postMessage
