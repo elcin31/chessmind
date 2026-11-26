@@ -1,11 +1,10 @@
 import { withAnalysisLock } from './analysisQueue'
-import { deviceCapabilities } from './device'
 import { Chess, DEFAULT_POSITION, type Color, type Move, type Square } from 'chess.js'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeftRight, ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Cpu, Flag, Pause, Play, RotateCcw, ScanLine, Target } from 'lucide-react'
 import { cloudBlocker, cloudState, useCloudStatus } from './cloudClient'
 import { ComputeSelect, computeLabels } from './ComputeSettings'
-import { cloudOptions, supportedCloudMode, type ComputeSource } from './cloudProtocol'
+import { cloudOptions, referenceFor, supportedCloudMode, type ComputeSource } from './cloudProtocol'
 import { AnalysisProgress, useLiveReview } from './AnalysisProgress'
 import { inspectDraft, validDraft } from './progressive'
 import { focusAnalysis } from './searchPool'
@@ -16,7 +15,7 @@ import { Chart } from './Charts'
 import { coachingPrinciple } from './coach'
 import { annotatedPgn, readClocks } from './pgn'
 import { budgets } from './engine'
-import { analysisKey, gameMoves, isComplete, playerColor, timeLabel, type EngineOptions, type Game, type Mode } from './library'
+import { adaptiveMode, analysisKey, methodologyVersion, reviewMode, reviewModes, gameMoves, isComplete, playerColor, timeLabel, type EngineOptions, type Game, type Mode } from './library'
 import { categories, errors, estimatedRating, evalLabel, expectation, phases, material, recheckMove, summarize, variation, type Review, type Category, type Phase } from './review'
 
 export const percent = (value?: number) => value === undefined ? '—' : value.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%'
@@ -43,11 +42,11 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   const [branches, setBranches] = useState<Move[]>([])
   const [playing, autoplay] = useState(false)
   const [guided, guide] = useState(false)
-  const [speed, setSpeed] = useState<Mode>(game?.mode ?? mode)
+  const [speed, setSpeed] = useState<Mode>(reviewMode(game?.mode ?? mode))
   const [computeSource, setComputeSource] = useState<ComputeSource>(base?.queueSource ?? preferredSource)
-  const device = deviceCapabilities()
-  const requestsCloud = computeSource !== 'local' || base?.compute === 'cloud'
-  const cloud = useCloudStatus(requestsCloud || device.mobile && supportedCloudMode(speed), requestsCloud)
+  const requestsCloud = !!base && supportedCloudMode(speed) && !!referenceFor(base) &&
+    (computeSource !== 'local' || base.compute === 'cloud')
+  const cloud = useCloudStatus(requestsCloud)
   const [compact, setCompact] = useState(false)
   const [graph, setGraph] = useState<'points' | 'cp'>('points')
   const [checked, setChecked] = useState<Record<number, Review>>({})
@@ -61,7 +60,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   const finished = !!game && isComplete(game)
   const byIndex = useMemo(() => !game ? [] : moves.map((_, i) =>
     game.reviews?.[i] ?? (!finished && draft ? inspectDraft(game, draft, i, moves) : undefined)),
-  [game?.id, game?.reviews, game?.mode, game?.options, game?.compute, draft, moves, finished])
+  [game?.id, game?.reviews, game?.mode, game?.options, game?.compute, game?.methodology, draft, moves, finished])
   const reviews = useMemo(() => byIndex.filter((item): item is Review => !!item), [byIndex])
   useEffect(() => {
     if (!base?.id || saved || index === 0) return
@@ -128,9 +127,12 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
     return remaining !== undefined && remaining <= 30
   })
   const compute = computeSource === 'auto' ? (game.compute ?? 'local') : computeSource
-  const sameProfile = !!base && analysisKey(base) === analysisKey({ methodology: 2, mode: speed, compute, options: compute === 'cloud' ? cloudOptions : options })
+  const sameProfile = !!base && analysisKey(base) === analysisKey({ methodology: methodologyVersion, mode: speed, compute, options: compute === 'cloud' ? cloudOptions : options })
   const changedEnergy = (game.options?.energy ?? 'balanced') !== (options?.energy ?? 'balanced')
-  const blocker = computeSource !== 'local' ? cloudBlocker(game, speed, cloud) : undefined
+  const hasCloudResult = [game, ...game.savedAnalyses ?? []].some(item =>
+    item.reviews?.length === game.moves && analysisKey(item) ===
+      analysisKey({ methodology: methodologyVersion, mode: speed, compute: 'cloud', options: cloudOptions }))
+  const blocker = computeSource !== 'local' && !hasCloudResult ? cloudBlocker(game, speed, cloud) : undefined
   const offerLocal = !saved && !game.queued && (computeSource === 'cloud' && !!blocker ||
     !completed && base?.compute === 'cloud' && active !== game.id)
   const switchLocal = () => { setComputeSource('local'); onQueue(game, speed, 'local') }
@@ -186,8 +188,8 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
             {item.methodology ?? 1}.0 · {computeLabels[item.compute ?? 'local']} · {budgets[item.mode].label} · {item.reviews.length} ходов · {item.mode !== 'lite' && item.options?.full ? 'Full' : 'Lite'} · {item.mode === 'professional' ? item.options?.multiplier ?? 1 : 1}×
           </option>)}
         </select> : null}
-        <select aria-label="Глубина анализа" value={speed} onChange={event => setSpeed(event.target.value as Mode)} disabled={!!saved || checking !== undefined}>
-          {Object.entries(budgets).map(([key, settings]) => <option key={key} value={key}>{settings.label}</option>)}
+        <select aria-label="Тип разбора" value={speed} onChange={event => setSpeed(event.target.value as Mode)} disabled={!!saved || checking !== undefined}>
+          {Object.entries(reviewModes).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
         </select>
         {!saved && (game.queued || active === game.id) && <button onClick={() => onPause(game)}><Pause size={16} /> Пауза</button>}
         {game.queued && !saved && (game.mode !== speed || (game.queueSource ?? 'local') !== computeSource || compute !== 'cloud' && changedEnergy) && <button className="primary" onClick={() => onQueue(game, speed, computeSource)}>Сменить режим</button>}
@@ -196,15 +198,15 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
         {reviews.some(item => !item.preliminary) && <button onClick={download}>PGN с разбором</button>}
       </div>
       {!saved && computeSource !== 'local' && <div className="preview-summary" role="status">
-        <span>{blocker ?? cloudState(cloud)}</span>
+        <span>{hasCloudResult ? 'Облачный результат сохранён на устройстве.' : blocker ?? cloudState(cloud)}</span>
       </div>}
-      {!saved && computeSource === 'local' && device.mobile && !cloudBlocker(game, speed, cloud) &&
-        <button onClick={() => setComputeSource('cloud')}>Выбрать облачный анализ</button>}
       {!saved && !game.queued && game.loadPaused &&
-        <button onClick={() => { setComputeSource('local'); onQueue(game, game.mode ?? speed, 'local', true) }}>Продолжить в Eco</button>}
+        <button onClick={() => { setComputeSource('local'); onQueue(game, speed, 'local', true) }}>Продолжить в Eco</button>}
       {draft?.interrupted && !completed && <p className="muted">Поиск прерван на позиции {draft.interrupted.index + 1}.
         {draft.interrupted.line && ' Сохранена предварительная оценка с глубины ' + draft.interrupted.line.depth + '.'}</p>}
-      {(speed === 'lite' || game.mode === 'lite') && <p className="muted">Mobile Lite · облегчённый анализ. Один вариант, без подтверждения Brilliant и Great.</p>}
+      {game.mode && !adaptiveMode(game.mode) && (game.reviews?.length || draft) && <p className="muted">
+        Сохранённый режим {budgets[game.mode].label}{game.mode === 'lite' ? ' · облегчённый анализ с одним вариантом' : ''}.
+      </p>}
       {offerLocal && <button onClick={switchLocal}>Продолжить на устройстве</button>}
       {!saved && !completed && (game.queued || active === game.id || draft?.interrupted || reviews.some(item => !item.preliminary) || !!instantCount && instantCount < moves.length + 1) && <>
         <AnalysisProgress id={game.id} initial={instantCount} checked={reviews.filter(item => !item.preliminary).length} total={moves.length}
@@ -212,7 +214,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
       </>}
       {!completed && ready && ready.index + 1 > index && <button className="jump-analyzed" onClick={() => navigate(ready.index + 1)}>К последнему готовому ходу</button>}
       {!saved && !completed && instantCount === moves.length + 1 && <div className="preview-summary" data-preview-ready>
-        <strong>Предварительная точность</strong><span>Белые {percent(white.accuracy)}</span><span>Чёрные {percent(black.accuracy)}</span>
+        <strong>Предварительный проход завершён</strong><span>Итоги появятся после сравнения сыгранных ходов с альтернативами.</span>
         {rankedErrors.length > 0 && <button onClick={() => navigate(rankedErrors[0].index + 1)}>К переломному моменту</button>}
       </div>}
       {completed && <p className="analysis-finished">Анализ завершён · {computeLabels[game.compute ?? 'local']}</p>}
@@ -255,14 +257,22 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
           {review ? <>
             <div className="move-heading">{review.preliminary ? <span className="marker">≈</span> : <Marker category={review.category} />}
               <strong>{last?.san} · {review.preliminary ? errors.includes(review.category) ? 'Возможная ошибка' : 'Предварительная оценка' : categories[review.category][0]}</strong>
-              <span>{review.depth > 0 ? 'Глубина ' + review.depth : 'Терминальная позиция'}</span></div>
+</div>
             <p>{review.explanation}</p>
+            {game.mode === 'deep-review' && review.critical && last && !review.preliminary &&
+              review.before.pv[0] !== review.played.pv[0] && review.after.pv.length > 0 &&
+              <p>После {last.san} ответ соперника в расчёте Stockfish — {variation(last.after, review.after.pv, 5).map(step => step.san).join(' ')}.</p>}
             {coachingPrinciple(review.motif) && <p className="muted">{coachingPrinciple(review.motif)}</p>}
             {review.draw && <p className="notice">{review.draw}</p>}
-            {review.reliable === false && <p className="notice">Категория предварительная. Сравнение на глубине {review.depth}; оценка могла меняться между итерациями.</p>}
+            {review.reliable === false && <p className="notice">Ограниченная надёжность оценки. Категория и потеря ожидания могут измениться после перепроверки.</p>}
             {verified && <p className="muted">Перепроверка Professional · {verified.before.engine ?? 'Stockfish'}. Сводная статистика использует исходный разбор.</p>}
             {review.reasons && <details><summary>Основания категории · сложность {review.complexity?.toLowerCase()}</summary>
               <ul>{review.reasons.map(reason => <li key={reason}>{reason}</li>)}</ul>
+            </details>}
+            {review.depth > 0 && <details><summary>Параметры оценки</summary>
+              <div className="analysis-counts"><span>Глубина {review.depth}</span><span>MultiPV {review.lines.length}</span>
+                {review.before.nodes !== undefined && <span>{review.before.nodes.toLocaleString('ru-RU')} узлов в сравнении</span>}
+                {review.before.engine && <span>{review.before.engine}</span>}</div>
             </details>}
             {review.played.wdl && <div className="wdl" aria-label="WDL после выбора хода">
               {[['Победа', review.color === 'w' ? 0 : 2], ['Ничья', 1], ['Поражение', review.color === 'w' ? 2 : 0]].map(([label, i]) =>
@@ -272,7 +282,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
               <div><small>Потеря ожидания</small><b>{number(review.loss)} п. п.</b></div>
               <div><small>Ожидание игрока</small><b>{percent(expectation(review.before, review.color, !!review.before.wdl && !!review.played.wdl))} → {percent(expectation(review.played, review.color, !!review.before.wdl && !!review.played.wdl))}</b></div></div>
             <div className="action-row">{checking !== undefined ? <button onClick={() => controller.current?.abort()}>Остановить перепроверку</button> :
-              <button disabled={!!active || !!saved} onClick={() => void verify()}>Перепроверить ход</button>}</div>
+              <button disabled={!!active || !!saved} onClick={() => void verify()}>{game.compute === 'cloud' ? 'Перепроверить на устройстве' : 'Перепроверить ход'}</button>}</div>
             {checkError && <p role="alert">{checkError}</p>}
             {checking !== undefined && <p role="status">Stockfish перепроверяет ход…</p>}
           </> : <p className="muted">{index ? 'Этот ход ещё не проанализирован.' : 'Выберите ход партии для просмотра объяснения.'}</p>}
@@ -296,6 +306,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
       <section className="panel"><h3>Итоги партии <small>· Методология {game.methodology ?? 1}.0</small></h3>
         <table><thead><tr><th>Показатель</th><th>Белые</th><th>Чёрные</th></tr></thead><tbody>
           <tr><td>Точность</td><td>{percent(white.accuracy)}</td><td>{percent(black.accuracy)}</td></tr>
+          {(white.limited > 0 || black.limited > 0) && <tr><td>Ходы с ограниченной надёжностью</td><td>{white.limited}/{white.sample}</td><td>{black.limited}/{black.sample}</td></tr>}
           <tr><td>ACPL</td><td>{number(white.acpl)} ({white.cpSample})</td><td>{number(black.acpl)} ({black.cpSample})</td></tr>
           <tr><td>Средняя потеря ожидания</td><td>{number(white.esl)} п. п.</td><td>{number(black.esl)} п. п.</td></tr>
           <tr><td>Разброс точности</td><td>{number(white.deviation)}</td><td>{number(black.deviation)}</td></tr>

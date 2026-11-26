@@ -1,6 +1,6 @@
 import type { ComputeSource } from './cloudProtocol'
 
-export const computeLabels = { local: 'На устройстве', cloud: 'В облаке', auto: 'Автоматически' } as const
+export const computeLabels = { auto: 'Автоматически', local: 'На устройстве', cloud: 'В облаке' } as const
 
 export function ComputeSelect({ value, onChange, disabled }: {
   value: ComputeSource; onChange: (value: ComputeSource) => void; disabled?: boolean

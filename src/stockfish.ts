@@ -1,15 +1,25 @@
 import { Chess } from 'chess.js'
 import { drawState } from './rules.js'
-import type { EngineOptions, Mode } from './game.js'
+import type { EngineOptions, LegacyMode, Mode } from './game.js'
 import type { Line } from './review.js'
 
-export const budgets = {
+const profiles = {
   lite: { label: 'Mobile Lite', depth: 9, extra: 1, lines: 1, nodes: 22_000 },
   quick: { label: 'Express', depth: 10, extra: 3, lines: 2, nodes: 45_000 },
   standard: { label: 'Standard', depth: 15, extra: 4, lines: 3, nodes: 220_000 },
   deep: { label: 'Deep', depth: 19, extra: 5, lines: 3, nodes: 950_000 },
   professional: { label: 'Professional', depth: 23, extra: 6, lines: 4, nodes: 2_000_000 },
 }
+
+export const budgets = {
+  ...profiles,
+  smart: { ...profiles.quick, label: 'Обычный' },
+  'deep-review': { ...profiles.deep, label: 'Глубокий' },
+}
+export const adaptiveBudgets = {
+  smart: { base: 'quick', critical: 'standard' },
+  'deep-review': { base: 'deep', critical: 'professional' },
+} as const satisfies Record<string, { base: LegacyMode; critical: LegacyMode }>
 
 export type Position = { initial: string; moves: string[]; fen: string; repetitions?: number; legal?: number }
 export function searchParameters(position: Position, mode: Mode, options: EngineOptions, critical: boolean,
@@ -24,7 +34,7 @@ export function searchParameters(position: Position, mode: Mode, options: Engine
   const choices = typeof only === 'string' ? only : only?.join(' ')
   const budget = budgets[mode]
   const depth = targetDepth ?? budget.depth + (critical ? budget.extra : 0)
-  const multiplier = mode === 'professional' ? Math.max(0.5, Math.min(3, options.multiplier ?? 1)) : 1
+  const multiplier = (mode === 'professional' || mode === 'deep-review') ? Math.max(0.5, Math.min(3, options.multiplier ?? 1)) : 1
   const count = typeof only === 'string' ? 1 : Math.min(legal, only?.length ?? maxLines ?? budget.lines)
   const nodesPerSearch = Math.round(budget.nodes * (critical ? mode === 'lite' ? 1.35 : 3 : 1) * multiplier)
   const nodes = targetNodes ?? nodesPerSearch * (only && typeof only !== 'string' ? count : 1)

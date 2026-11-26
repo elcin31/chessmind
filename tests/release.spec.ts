@@ -16,7 +16,7 @@ test('production PWA: реальные партии, WASM, разбор и эк�
   await page.getByRole('button', { name: 'Импортировать PGN' }).click()
   await expect(page.getByRole('status').getByText(/Добавлено: 2/)).toBeVisible()
   await page.getByRole('button', { name: /Morphy – Duke/ }).click()
-  await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption('quick')
+  await page.getByRole('combobox', { name: 'Тип разбора' }).selectOption('smart')
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 100_000 })
   await page.getByRole('button', { name: 'Конец партии' }).click()
@@ -30,7 +30,7 @@ test('production PWA: реальные партии, WASM, разбор и эк�
   await page.goto('/#review')
   await page.goto('/#games')
   await page.getByRole('button', { name: /Anderssen.*Kieseritzky/ }).click()
-  await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption('quick')
+  await page.getByRole('combobox', { name: 'Тип разбора' }).selectOption('smart')
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 100_000 })
   await page.getByRole('button', { name: 'Конец партии' }).click()
@@ -43,6 +43,7 @@ test('миграция IndexedDB 1.0 и мобильная компоновка'
   await page.route('**/seed.html', route => route.fulfill({ status: 200, contentType: 'text/html', body: 'Seed' }))
   await page.goto('/seed.html')
   await page.evaluate(pgn => new Promise<void>((resolve, reject) => {
+    localStorage.setItem('chessmind-settings', JSON.stringify({ nickname: '', theme: 'system', mode: 'lite' }))
     const request = indexedDB.open('chessmind-review', 1)
     request.onupgradeneeded = () => {
       const database = request.result
@@ -63,6 +64,9 @@ test('миграция IndexedDB 1.0 и мобильная компоновка'
   }), opera)
   await page.goto('/#review/legacy')
   await expect(page.getByRole('heading', { name: /Morphy.*Duke and Count/ })).toBeVisible()
+  await expect(page.getByRole('combobox', { name: 'Тип разбора' })).toHaveValue('smart')
+  await expect(page.getByRole('combobox', { name: 'Источник вычислений' })).toHaveValue('local')
+  await expect(page.getByText('Сохранённый режим Standard.')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Вперёд' })).toBeVisible()
   await page.getByRole('button', { name: 'Вперёд' }).click()
   await expect(page.locator('.board-context')).toContainText('1. e4')
@@ -83,6 +87,7 @@ test('миграция IndexedDB 1.0 и мобильная компоновка'
 
 test('реальный Stockfish Full по запросу и продолжение после права на ничью', async ({ page }) => {
   await page.goto('/#settings')
+  await page.getByText('Технические настройки', { exact: true }).click()
   await page.getByLabel('Stockfish Full', { exact: false }).check()
   await page.goto('/#home')
   await page.getByRole('button', { name: 'PGN', exact: true }).click()
@@ -96,7 +101,7 @@ test('реальный Stockfish Full по запросу и продолжен�
 51. Rh8+ Kf7 52. Rh7+ 1-0`)
   await page.getByRole('button', { name: 'Импортировать PGN' }).click()
   await page.getByRole('button', { name: /White – Black/ }).click()
-  await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption('quick')
+  await page.getByRole('combobox', { name: 'Тип разбора' }).selectOption('smart')
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 125_000 })
   await page.getByRole('button', { name: 'Вперёд' }).click()

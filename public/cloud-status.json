@@ -1,1 +1,1 @@
-{"available":false,"reason":"quota_guard_unavailable","modes":["quick","standard"],"engine":"stockfish-19.0.1-lite-single"}
+{"available":false,"reason":"quota_guard_unavailable","modes":["smart","quick","standard"],"engine":"stockfish-19.0.1-lite-single"}

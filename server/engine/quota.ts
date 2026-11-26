@@ -79,7 +79,7 @@ function billingPeriod(now: number) {
 // Keep the search revision in this key when changing scheduler or UCI behavior.
 export function analysisCacheKey(fingerprint: string, mode: CloudMode, book: number) {
   return createHash('sha256')
-    .update(JSON.stringify(['search-1', fingerprint, cloudEngine, 'lite-single', mode, methodologyVersion, cloudOptions, budgets[mode], book]))
+    .update(JSON.stringify(['search-2', fingerprint, cloudEngine, 'lite-single', mode, methodologyVersion, cloudOptions, budgets[mode], mode === 'smart' ? budgets.standard : null, book]))
     .digest('hex')
 }
 
@@ -208,7 +208,9 @@ function cappedNumber(value: string | undefined, maximum: number) {
 }
 
 export function productionAdmission(env = process.env) {
-  const url = env.UPSTASH_REDIS_REST_URL, token = env.UPSTASH_REDIS_REST_TOKEN
+  const [url, token] = env.UPSTASH_REDIS_REST_URL || env.UPSTASH_REDIS_REST_TOKEN
+    ? [env.UPSTASH_REDIS_REST_URL, env.UPSTASH_REDIS_REST_TOKEN]
+    : [env.KV_REST_API_URL, env.KV_REST_API_TOKEN]
   if (!url || !token || !/^https:\/\/[a-z0-9-]+\.upstash\.io\/?$/i.test(url)) return
   const concurrent = cappedNumber(env.CHESSMIND_MAX_CONCURRENT_ANALYSES, cloudLimits.concurrent)
   if (concurrent !== 1) return

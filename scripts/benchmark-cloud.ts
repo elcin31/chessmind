@@ -20,9 +20,9 @@ const redis = redisSocket ? {
   eval: (script: string, keys: string[], args: unknown[]) =>
     command('EVAL', script, String(keys.length), ...keys, ...args.map(String)),
 } as Pick<Redis, 'eval' | 'get'> : undefined
-const modes = ['quick', 'standard'] as const
+const modes = ['smart'] as const
 for (const mode of modes) {
-  const records = Object.fromEntries(Object.entries(fixtures).map(([id, pgn]) => [id, mode === 'quick' ? pgn : ending(pgn, 4)]))
+  const records = Object.fromEntries(Object.entries(fixtures).map(([id, pgn]) => [id, process.env.BENCH_TAIL ? ending(pgn, Number(process.env.BENCH_TAIL)) : pgn]))
   const handle = engineHandler({
     admission: redis ? new RedisAdmission(redis, 'loopback-benchmark') : sampleAdmission(), enabled: () => true,
     request: async input => {

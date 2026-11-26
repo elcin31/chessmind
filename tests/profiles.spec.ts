@@ -60,7 +60,7 @@ test('готовые ходы доступны при активном поис�
   await page.getByRole('textbox', { name: 'Текст PGN' }).fill(immortal)
   await page.getByRole('button', { name: 'Импортировать PGN' }).click()
   await page.getByRole('button', { name: /Anderssen – Kieseritzky/ }).click()
-  await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption('standard')
+  await page.getByRole('combobox', { name: 'Тип разбора' }).selectOption('smart')
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByLabel('Параметры поиска')).toContainText('узлов/с')
   const jump = page.getByRole('button', { name: 'К последнему готовому ходу' })

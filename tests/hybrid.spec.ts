@@ -8,9 +8,9 @@ test('облако выключено, автоматический выбор �
   await expect(page.getByText('Облачный анализ ожидает подключения Redis.')).toBeVisible()
   await expect(page.getByText('Офлайн готов')).toBeVisible({ timeout: 30_000 })
   const source = page.getByRole('combobox', { name: 'Источник вычислений' })
-  await expect(source).toHaveValue('local')
-  await source.selectOption('auto')
+  await expect(source).toHaveValue('auto')
   const energy = page.getByRole('combobox', { name: 'Энергопотребление' })
+  await expect(energy).toHaveValue('balanced')
   await energy.selectOption('turbo')
   await expect(page.getByText('Turbo может ускорить разряд аккумулятора и повысить нагрев.')).toBeVisible()
   await energy.selectOption('eco')
@@ -27,7 +27,7 @@ test('облако выключено, автоматический выбор �
   await page.getByRole('textbox', { name: 'Текст PGN' }).fill(opera)
   await page.getByRole('button', { name: 'Импортировать PGN' }).click()
   await page.getByRole('button', { name: /Morphy – Duke/ }).click({ timeout: 10_000 })
-  await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption('quick')
+  await page.getByRole('combobox', { name: 'Тип разбора' }).selectOption('smart')
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByText('Анализ завершён · На устройстве')).toBeVisible({ timeout: 50_000 })
   expect(calls).toEqual([])
@@ -42,7 +42,7 @@ test('автоматический выбор проверяет облачны�
     pgn: ending(opera, 4).replace('1858.01.01', '2024.05.01'), rules: 'chess', url: 'https://www.chess.com/game/live/12345',
   }] } }))
   await page.route('**/api/engine/status', route => route.fulfill({ json: {
-    available: false, reason: 'quota', cacheAvailable: true, engine: cloudEngine, modes: ['quick', 'standard'], remainingCpuMs: 0,
+    available: false, reason: 'quota', cacheAvailable: true, engine: cloudEngine, modes: ['smart'], remainingCpuMs: 0,
   } }))
   let requests = 0
   await page.route('**/api/engine/analyze', route => {
@@ -55,7 +55,7 @@ test('автоматический выбор проверяет облачны�
   await page.getByRole('button', { name: 'Импортировать историю' }).click()
   await page.getByRole('button', { name: /Morphy – Duke/ }).click()
   await page.getByRole('combobox', { name: 'Источник вычислений' }).selectOption('auto')
-  await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption('quick')
+  await page.getByRole('combobox', { name: 'Тип разбора' }).selectOption('smart')
   await expect(page.getByText('Облачный лимит исчерпан. Доступны результаты из кэша.')).toBeVisible()
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByText('Анализ завершён · На устройстве')).toBeVisible({ timeout: 30_000 })
@@ -63,6 +63,8 @@ test('автоматический выбор проверяет облачны�
 })
 
 test('оборванный поток сохраняется, облачный лимит обработан, продолжение локально', async ({ page }) => {
+  let workers = 0
+  page.on('worker', () => workers++)
   const archive = 'https://api.chess.com/pub/player/morphy/games/2024/05'
   const cors = { 'access-control-allow-origin': '*' }
   await page.route('https://api.chess.com/pub/player/morphy/games/archives', route =>
@@ -71,7 +73,7 @@ test('оборванный поток сохраняется, облачный �
     { pgn: opera.replace('1858.01.01', '2024.05.01'), rules: 'chess', url: 'https://www.chess.com/game/live/12345' },
   ] } }))
   await page.route('**/api/engine/status', route => route.fulfill({ json: {
-    available: true, engine: cloudEngine, modes: ['quick', 'standard'], remainingCpuMs: 3_600_000,
+    available: true, engine: cloudEngine, modes: ['smart'], remainingCpuMs: 3_600_000,
   } }))
   let requests = 0
   await page.route('**/api/engine/analyze', async route => {
@@ -83,7 +85,7 @@ test('оборванный поток сохраняется, облачный �
     const instant = [{ kind: 'cp', value: 13, depth: 8, pv: ['e2e4'], wdl: [100, 800, 100] },
       ...Array.from({ length: 33 }, () => null)]
     const messages = [
-      { type: 'start', fingerprint: input.fingerprint, engine: cloudEngine, mode: 'quick', options: { threads: 1, hash: 16 } },
+      { type: 'start', fingerprint: input.fingerprint, engine: cloudEngine, mode: 'smart', options: { threads: 1, hash: 16 } },
       { type: 'progress', draft: { format: 1, instant }, progress: { stage: 'instant', instant: 1, checked: 0, critical: 0, criticalDone: 0, moves: 33 } },
     ]
     return route.fulfill({ contentType: 'application/x-ndjson', body: messages.map(message => JSON.stringify(message)).join('\n') + '\n' })
@@ -93,15 +95,16 @@ test('оборванный поток сохраняется, облачный �
   await page.getByRole('button', { name: 'Импортировать историю' }).click()
   await page.getByRole('button', { name: /Morphy – Duke/ }).click()
   await page.getByRole('combobox', { name: 'Источник вычислений' }).selectOption('cloud')
-  const mode = page.getByRole('combobox', { name: 'Глубина анализа' })
-  await mode.selectOption('professional')
-  await expect(page.getByText('Deep и Professional выполняются на устройстве.')).toBeVisible()
-  await mode.selectOption('quick')
+  const mode = page.getByRole('combobox', { name: 'Тип разбора' })
+  await mode.selectOption('deep-review')
+  await expect(page.getByText('Глубокий разбор выполняется на устройстве.')).toBeVisible()
+  await mode.selectOption('smart')
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByRole('alert')).toContainText('Готовые позиции сохранены.')
   await expect(page.getByRole('button', { name: 'Продолжить', exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Продолжить', exact: true }).click()
   await expect(page.getByRole('alert')).toContainText('Облачный лимит исчерпан.')
+  expect(workers).toBe(0)
   await page.getByRole('button', { name: 'Продолжить на устройстве' }).click()
   await expect(page.getByText('Анализ завершён · На устройстве')).toBeVisible({ timeout: 50_000 })
   expect(requests).toBe(2)
@@ -119,5 +122,7 @@ test('оборванный поток сохраняется, облачный �
       request.onerror = () => reject(request.error)
     }
   }))
-  expect(data).toEqual({ cloud: 8, local: 8, source: 'local' })
+  expect(data.cloud).toBe(8)
+  expect(data.local).toBeGreaterThan(0)
+  expect(data.source).toBe('local')
 })

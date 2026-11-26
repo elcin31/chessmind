@@ -67,21 +67,22 @@ export class ServerStockfish {
   }
 
   evaluate = async (position: Position, mode: Mode, critical = false, only?: string | readonly string[],
-    targetDepth?: number, targetNodes?: number, maxLines?: number): Promise<Line[]> => {
+    targetDepth?: number, targetNodes?: number, maxLines?: number, independent = false): Promise<Line[]> => {
     this.signal.throwIfAborted()
     const params = searchParameters(position, mode, this.options, critical, only, targetDepth, targetNodes, maxLines)
     if (params.terminal) return params.terminal
     const { count, depth, nodes, history, choices, turn } = params
-    const key = JSON.stringify([history, count, depth, nodes, choices])
+    const key = JSON.stringify([history, count, depth, nodes, choices, independent])
     const hit = this.cache.get(key)
     if (hit) return hit
     await (this.ready ??= this.start())
 
     const commands: string[] = []
     if (this.count !== count) commands.push('setoption name MultiPV value ' + count)
-    if (this.position !== history) commands.push('position fen ' + history)
+    if (independent || this.position !== history) commands.push('position fen ' + history)
     this.count = count
     this.position = history
+    if (independent) await this.exchange(['ucinewgame', 'isready'], 'readyok')
     commands.push('go depth ' + depth + ' nodes ' + nodes + (choices ? ' searchmoves ' + choices : ''))
     const output = collectLines(count, turn, 'Cloud · ' + cloudEngine)
     this.searches++

@@ -46,7 +46,7 @@ export function useCloudStatus(visible: boolean, poll = true) {
 }
 
 export function cloudBlocker(game: Game | undefined, mode: Mode, status: CloudStatus | undefined) {
-  if (!supportedCloudMode(mode)) return mode === 'lite' ? 'Mobile Lite выполняется на устройстве.' : 'Deep и Professional выполняются на устройстве.'
+  if (!supportedCloudMode(mode)) return mode === 'lite' ? 'Mobile Lite выполняется на устройстве.' : 'Глубокий разбор выполняется на устройстве.'
   if (game && !referenceFor(game)) return 'Для облака нужна партия из официального архива Chess.com или Lichess.'
   if (game && game.moves > cloudLimits.plies[mode]) return 'Облачный лимит для этого режима — ' + cloudLimits.plies[mode] + ' полуходов.'
   if (!status) return 'Проверяем доступность облака…'
@@ -109,6 +109,8 @@ function validReview(review: Review | undefined, index: number) {
 }
 function validDraft(draft: Draft, moves: number, profile: string) {
   return draft?.format === 1 && draft.instant?.length === moves + 1 && draft.instant.every(line => line === null || validLine(line)) &&
+    (!draft.alternatives || draft.previewVersion === 1 && Array.isArray(draft.alternatives) &&
+      draft.alternatives.length === moves + 1 && draft.alternatives.every(line => line === null || validLine(line))) &&
     (!draft.work || (draft.work.profile === profile && Array.isArray(draft.work.critical) &&
       draft.work.critical.every(index => Number.isInteger(index) && index >= 0 && index < moves) &&
       draft.work.reviews && Object.entries(draft.work.reviews).every(([key, review]) =>
@@ -137,16 +139,15 @@ export async function analyzeInCloud(game: Game, mode: Mode, signal: AbortSignal
     })
   } catch {
     signal.throwIfAborted()
-    throw new Error('Связь с облаком прервалась. Продолжите на устройстве.')
+    throw new CloudUnavailable('Связь с облаком прервалась. Продолжите на устройстве.')
   }
   if (!response.ok) {
     const error: { message?: string } = await response.json().catch(() => ({}))
-    if ([400, 404, 422, 429, 503].includes(response.status)) {
-      throw new CloudUnavailable(error.message ?? 'Облачный анализ недоступен.')
-    }
-    throw new Error(error.message ?? 'Облачный анализ недоступен. Продолжите на устройстве.')
+    throw new CloudUnavailable(error.message ?? 'Облачный анализ недоступен. Продолжите на устройстве.')
   }
-  if (!response.body || !response.headers.get('content-type')?.startsWith('application/x-ndjson')) throw new Error('Облако вернуло неверный ответ.')
+  if (!response.body || !response.headers.get('content-type')?.startsWith('application/x-ndjson')) {
+    throw new CloudUnavailable('Облако вернуло неверный ответ.')
+  }
   const reader = response.body.getReader()
   const decode = new TextDecoder()
   let pending = ''
@@ -176,7 +177,7 @@ export async function analyzeInCloud(game: Game, mode: Mode, signal: AbortSignal
           cached = event.cached === true
           continue
         }
-        if (event.type === 'error') throw new Error(event.message)
+        if (event.type === 'error') throw new CloudUnavailable(event.message)
         if (!started) throw new Error('Облако не подтвердило запись партии.')
         if (event.type === 'telemetry') telemetry(event.sample)
         if (event.type === 'progress') {
@@ -197,6 +198,10 @@ export async function analyzeInCloud(game: Game, mode: Mode, signal: AbortSignal
     if (!delivered) await update(result.draft, { stage: 'final', instant: game.moves + 1, checked: game.moves,
       critical: 0, criticalDone: 0, moves: game.moves })
     return { ...result, cached }
+  } catch (error) {
+    signal.throwIfAborted()
+    if (error instanceof CloudUnavailable) throw error
+    throw new CloudUnavailable(error instanceof Error ? error.message : 'Связь с облаком прервалась.')
   } finally {
     await reader.cancel().catch(() => {})
     reader.releaseLock()

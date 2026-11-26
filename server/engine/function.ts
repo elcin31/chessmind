@@ -1,13 +1,13 @@
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { cloudEngine, cloudLimits, cloudOptions, gameFingerprint, type CloudMode, type CloudStatus, type GameReference } from '../../src/cloudProtocol.js'
+import { cloudEngine, cloudLimits, cloudOptions, gameFingerprint, supportedCloudMode, type CloudMode, type CloudStatus, type GameReference } from '../../src/cloudProtocol.js'
 import { methodologyVersion, readGame, type Game, type Opening } from '../../src/game.js'
 import { analyzeProgressively } from '../../src/progressive.js'
 import { ServerStockfish } from './stockfish.js'
 import { officialPgn, readText, RequestFailure } from './verification.js'
 import { analysisCacheKey, type Admission, type CloudResult, type Permit } from './quota.js'
 
-const disabled: CloudStatus = { available: false, reason: 'quota_guard_unavailable', modes: ['quick', 'standard'], engine: cloudEngine }
+const disabled: CloudStatus = { available: false, reason: 'quota_guard_unavailable', modes: ['smart', 'quick', 'standard'], engine: cloudEngine }
 const json = (body: object, status = 200) =>
   Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } })
 const fail = (status: number, code: string, message: string) => json({ code, message }, status)
@@ -23,7 +23,7 @@ function input(value: unknown): { reference: GameReference; fingerprint: string;
     throw new RequestFailure(400, 'invalid', 'Требуется ссылка на игру из официального архива.')
   }
   const { reference: ref, mode, fingerprint } = value
-  if (mode !== 'quick' && mode !== 'standard') throw new RequestFailure(422, 'mode', 'Этот режим доступен на устройстве.')
+  if (!supportedCloudMode(mode)) throw new RequestFailure(422, 'mode', 'Этот режим доступен на устройстве.')
   if (!object(ref) || typeof ref.id !== 'string') throw new RequestFailure(400, 'invalid', 'Неверная ссылка на партию.')
   if (ref.platform === 'lichess' && keys(ref, ['platform', 'id']) && /^[A-Za-z0-9]{8}$/.test(ref.id)) {
     return { reference: { platform: 'lichess', id: ref.id }, fingerprint, mode }

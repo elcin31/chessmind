@@ -7,14 +7,14 @@ import { deviceCapabilities } from './device'
 import { markGameFinished, waitBetweenGames, withAnalysisLock } from './analysisQueue'
 import { AnalysisLoadPause } from './loadControl'
 import { ComputeSelect } from './ComputeSettings'
-import { cloudOptions, type ComputeEngine, type ComputeSource, type Energy } from './cloudProtocol'
+import { cloudOptions, referenceFor, supportedCloudMode, type ComputeEngine, type ComputeSource, type Energy } from './cloudProtocol'
 import { updateLiveReview, updateProgress } from './AnalysisProgress'
 import { GameCard } from './PlayerCard'
 import { Board } from './Board'
 import { ImportForm } from './Import'
 import { Empty, ReviewScreen } from './ReviewScreen'
 import { budgets, SearchInterrupted, trimCache } from './engine'
-import { analysisKey, db, methodologyVersion, historicalRating, isComplete, parsePgn, playerColor, timeLabel, type Analysis, type EngineOptions, type Game, type Mode, type Practice } from './library'
+import { adaptiveMode, analysisKey, db, methodologyVersion, reviewMode, reviewModes, historicalRating, isComplete, parsePgn, playerColor, timeLabel, type Analysis, type EngineOptions, type Game, type Mode, type Practice } from './library'
 import { categories, type Line, type Review } from './review'
 import { analyzeProgressively, hasPreview, type Draft, type StageProgress } from './progressive'
 import type { PoolStatus } from './searchPool'
@@ -27,7 +27,7 @@ const Openings = lazy(() => import('./Stats').then(module => ({ default: module.
 const Endgames = lazy(() => import('./Endgames').then(module => ({ default: module.Endgames })))
 
 const mobileWarning = 'Анализ выполняется на вашем устройстве и может увеличивать расход заряда аккумулятора и нагрев телефона'
-const professionalWarning = 'Профессиональный анализ требует значительных вычислительных ресурсов. Рекомендуется использовать его для наиболее важных партий'
+const deepWarning = 'Глубокий разбор может занять несколько минут'
 const queueEventKey = 'chessmind-queue-event'
 type QueueEvent = { id: string; manual?: boolean }
 
@@ -48,8 +48,12 @@ const core: Page[] = ['home', 'games', 'review', 'training', 'stats']
 const secondary: Page[] = ['openings', 'endgames', 'settings', 'methodology']
 
 function loadSettings(): Settings {
-  const defaults: Settings = { nickname: '', theme: 'system', mode: deviceCapabilities().mobile ? 'quick' : 'standard' }
-  try { return { ...defaults, ...JSON.parse(localStorage.getItem('chessmind-settings') || '{}') } }
+  const defaults: Settings = { nickname: '', theme: 'system', mode: 'smart', computeSource: 'auto' }
+  try {
+    const saved: Partial<Settings> = JSON.parse(localStorage.getItem('chessmind-settings') || '{}')
+    return { ...defaults, ...saved, mode: reviewMode(saved.mode),
+      computeSource: saved.computeSource ?? (saved.mode && !adaptiveMode(saved.mode) ? 'local' : 'auto') }
+  }
   catch { return defaults }
 }
 function route(): { page: Page; id?: string; ply?: number } {
@@ -175,12 +179,12 @@ function App() {
   }
   useEffect(() => {
     const warned = !deviceCapabilities().mobile || localStorage.getItem('chessmind-mobile-local-warning')
-    const autoPreview = settings.engine?.energy === 'eco' || !warned ? 0 : settings.autoPreview || 0
+    const autoPreview = settings.engine?.energy === 'eco' || settings.computeSource === 'cloud' || !warned ? 0 : settings.autoPreview || 0
     if (!autoPreview && current.current?.automatic) current.current.controller.abort()
     if (!visible || current.current || active) return
     const manual = games.filter(game => game.queued).sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0))[0]
     const pending = manual ?? sorted.slice(0, autoPreview)
-      .find(game => !isComplete(game) && !game.autoPreviewPaused && !hasPreview(game))
+      .find(game => game.queueSource !== 'cloud' && !isComplete(game) && !game.autoPreviewPaused && !hasPreview(game))
     if (!pending) return
     const automatic = !manual
     const controller = new AbortController()
@@ -200,9 +204,9 @@ function App() {
       }
       let latest = await storage.get('games', pending.id)
       if (!latest || controller.signal.aborted || !automatic && (!latest.queued || latest.queuedAt !== pending.queuedAt) ||
-        automatic && (latest.queued || latest.autoPreviewPaused || hasPreview(latest) || isComplete(latest))) return mergeGame(latest)
-      if (!automatic && latest.methodology !== 2) {
-        latest = await patchGame(latest.id, prepareAnalysis(latest, latest.mode ?? 'standard', settings.engine))
+        automatic && (latest.queued || latest.queueSource === 'cloud' || latest.autoPreviewPaused || hasPreview(latest) || isComplete(latest))) return mergeGame(latest)
+      if (!automatic && !latest.methodology) {
+        latest = await patchGame(latest.id, prepareAnalysis(latest, latest.mode ?? 'smart', settings.engine))
       }
       if (!latest) return
       if (localStorage.getItem(stopKey(latest)) === stopRevision(latest)) {
@@ -225,7 +229,7 @@ function App() {
       let persisted = ''
       let saving = Promise.resolve()
       const copy = (draft: Draft): Draft => ({
-        ...draft, instant: [...draft.instant],
+        ...draft, instant: [...draft.instant], alternatives: draft.alternatives && [...draft.alternatives],
         work: draft.work && { ...draft.work, reviews: { ...draft.work.reviews } },
       })
       const publish = (transition = false) => {
@@ -257,7 +261,9 @@ function App() {
             // An old task may contribute Instant positions after a mode switch.
             const completedDraft = final?.reviews && !finished ? checkpoint : draft
             const field = compute === 'cloud' ? 'cloudDraft' : 'draft'
-            const updated = { ...record, [field]: unchanged ? completedDraft : { ...completedDraft, work: record[field]?.work, interrupted: record[field]?.interrupted },
+            const nextDraft = unchanged ? completedDraft :
+              mergeDraft(record[field], { ...completedDraft, work: undefined, interrupted: undefined })
+            const updated = { ...record, [field]: nextDraft,
               ...(finished ? { reviews: final.reviews, queued: false, loadPaused: false, cloudCacheHit: final.cached === true } : {}) }
             await tx.store.put(updated)
             await tx.done
@@ -267,7 +273,8 @@ function App() {
         return saving
       }
       try {
-        const selected = automatic ? { ...latest, options: settings.engine, compute: 'local' as const } : latest
+        const selected = automatic ? { ...latest, options: settings.engine, compute: 'local' as const }
+          : compute === 'cloud' ? { ...latest, draft: latest.cloudDraft } : latest
         const update = async (draft: Draft, next: StageProgress) => {
             const transition = status?.stage !== next.stage
             status = next
@@ -301,7 +308,7 @@ function App() {
           if (record && record.queuedAt === queuedAt) {
             if (!automatic && compute === 'cloud' && record.queueSource === 'auto' && error instanceof CloudUnavailable) {
               const update = { ...record, ...prepareAnalysis(record, record.mode ?? settings.mode, settings.engine),
-                queuedAt: Math.max(Date.now(), (queuedAt ?? 0) + 1), draft: reuseInstant(record) }
+                queuedAt: Math.max(Date.now(), (queuedAt ?? 0) + 1) }
               if (isComplete(update)) update.queued = false
               await tx.store.put(update)
             } else {
@@ -325,18 +332,29 @@ function App() {
       updateProgress(undefined)
       setActive(undefined)
     })
-  }, [games, sorted, visible, active, settings.autoPreview, settings.engine, settings.mode])
+  }, [games, sorted, visible, active, settings.autoPreview, settings.engine, settings.mode, settings.computeSource])
 
   const open = useCallback((game: Game, ply?: number) => { window.location.hash = 'review/' + game.id + (ply ? '/' + ply : '') }, [])
   function go(page: Page) { window.location.hash = page }
-  async function queueBatch(items: Game[], mode: Mode, change = false, source = settings.computeSource ?? 'local', eco = false) {
+  async function queueBatch(items: Game[], mode: Mode, change = false, source = settings.computeSource ?? 'auto', eco = false) {
     if (submitting.current) return
     submitting.current = true
     setStatus('')
     try {
-      const status = source === 'local' ? undefined : await getCloudStatus()
+      const localOptions = (game: Game) => eco ? { ...(game.compute === 'local' ? game.options : settings.engine), energy: 'eco' as const } : settings.engine
       const selections = new Map<string, ComputeEngine>()
       for (const game of items) {
+        if (source !== 'cloud' && isComplete({ ...game, ...prepareAnalysis(game, mode, localOptions(game)) })) {
+          selections.set(game.id, 'local')
+        } else if (source !== 'local' && isComplete({ ...game, ...prepareAnalysis(game, mode, cloudOptions, 'cloud') })) {
+          selections.set(game.id, 'cloud')
+        }
+      }
+      const mayUseCloud = source !== 'local' && supportedCloudMode(mode) &&
+        items.some(game => !selections.has(game.id) && referenceFor(game))
+      const status = mayUseCloud ? await getCloudStatus() : undefined
+      for (const game of items) {
+        if (selections.has(game.id)) continue
         const issue = source === 'cloud' && cloudBlocker(game, mode, status)
         if (issue) { setStatus(issue); continue }
         selections.set(game.id, chooseCompute(source, game, mode, status))
@@ -346,7 +364,7 @@ function App() {
         const first = !localStorage.getItem('chessmind-mobile-local-warning')
         const warning = [
           first && mobileWarning,
-          mode === 'professional' && professionalWarning,
+          mode === 'deep-review' && deepWarning,
         ].filter(Boolean).join('.\n\n')
         if (warning && !window.confirm(warning + '.')) return
         if (first) localStorage.setItem('chessmind-mobile-local-warning', '1')
@@ -358,11 +376,10 @@ function App() {
         const latest = await tx.store.get(item.id)
         const compute = selections.get(item.id)
         if (!latest || !compute || !['1-0', '0-1', '1/2-1/2'].includes(latest.result)) continue
-        const options = compute === 'cloud' ? cloudOptions : eco ? { ...latest.options, energy: 'eco' as const } : settings.engine
+        const options = compute === 'cloud' ? cloudOptions : localOptions(latest)
         if (latest.queued && (!change || latest.mode === mode && latest.compute === compute &&
           (latest.queueSource ?? 'local') === source && JSON.stringify(latest.options) === JSON.stringify(options))) continue
-        const draft = compute === 'local' ? reuseInstant(latest) : latest.draft
-        const updated = { ...latest, ...prepareAnalysis(latest, mode, options, compute), draft, queueSource: source,
+        const updated = { ...latest, ...prepareAnalysis(latest, mode, options, compute), queueSource: source,
           queuedAt: Math.max(queuedAt + index, (latest.queuedAt ?? 0) + 1), autoPreviewPaused: false, loadPaused: false }
         if (isComplete(updated)) updated.queued = false
         await tx.store.put(updated)
@@ -398,7 +415,7 @@ function App() {
       <a href="#home" className="brand"><img src="/icon.svg" width="43" height="43" alt="" /><div>Chess<span>Mind</span><small>АНАЛИЗ ПАРТИЙ</small></div></a>
       <nav aria-label="Основные разделы" className="main-nav">{navigation(core)}</nav>
       <nav aria-label="Дополнительные разделы" className="secondary-nav">{navigation(secondary)}</nav>
-      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0.5</small></div>
+      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0.6</small></div>
     </aside>
     <main>
       <header className="topbar">
@@ -424,7 +441,7 @@ function App() {
         }}>Обновить</button></div>}
         {location.page === 'home' && <>
           <section className="hero">
-            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0.5</div>
+            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0.6</div>
               <h1>Разбор шахматных<br className="desktop-break" /> партий</h1>
               <p>Найдите переломные ходы, проверьте варианты Stockfish и потренируйтесь на собственных ошибках.</p>
               <div className="hero-actions"><a className="primary" href="#games"><ArrowDownToLine size={18} /> Добавить партию</a>
@@ -448,7 +465,7 @@ function App() {
           <footer className="home-footer"><span><Cpu size={16} /> Все расчёты на вашем устройстве</span><span><Zap size={16} /> Бесплатно и без лимитов</span><span><MonitorDown size={16} /> Устанавливается как приложение</span></footer>
         </>}
         {location.page === 'games' && <>{importForm}<GameList games={sorted} nickname={settings.nickname} open={open} queue={items => void queueBatch(items, settings.mode)} /></>}
-        {location.page === 'review' && <ReviewScreen key={(selected?.id ?? '') + ':' + (location.ply ?? 0)} game={selected} initialPly={location.ply} games={games} nickname={settings.nickname} mode={settings.mode} active={active} options={settings.engine} preferredSource={settings.computeSource ?? 'local'} onQueue={queue} onPause={pause} onImport={() => go('games')} />}
+        {location.page === 'review' && <ReviewScreen key={(selected?.id ?? '') + ':' + (location.ply ?? 0)} game={selected} initialPly={location.ply} games={games} nickname={settings.nickname} mode={settings.mode} active={active} options={settings.engine} preferredSource={settings.computeSource ?? 'auto'} onQueue={queue} onPause={pause} onImport={() => go('games')} />}
         <Suspense fallback={<p role="status">Загружаем раздел…</p>}>
         {location.page === 'training' && <Training games={games} nickname={settings.nickname} practice={practice} onPractice={item => setPractice(old => [...old.filter(entry => entry.id !== item.id), item])} onImport={() => go('games')} />}
         {location.page === 'stats' && <Statistics games={games} nickname={settings.nickname} open={open} />}
@@ -493,20 +510,17 @@ function GameList({ games, nickname, open, queue }: { games: Game[]; nickname: s
   </section>
 }
 
-function reuseInstant(game: Game) {
-  const remote = game.cloudDraft
-  if (!remote || remote.format !== 1 || remote.instant.length !== game.moves + 1) return game.draft
-  // The stream was bound to a hash of this complete game and the same Lite
-  // build. Position estimates are reusable; adjudicated cloud moves stay separate.
-  return { ...game.draft, format: 1 as const, instant: remote.instant.map((line, index) => {
-    const local = game.draft?.instant[index]
-    return (local?.depth ?? -1) >= (line?.depth ?? -1) ? local ?? null : line
-  }) }
-}
-
 function prepareAnalysis(game: Game, mode: Mode, options?: EngineOptions, compute: ComputeEngine = 'local'): Partial<Game> {
   const next = { mode, options, compute, methodology: methodologyVersion } as const
-  if (analysisKey(game) === analysisKey(next)) return { ...next, queued: true }
+  const field = compute === 'cloud' ? 'cloudDraft' : 'draft'
+  const oldDraft = game[field]
+  const savedDrafts = { ...game.savedDrafts }
+  const priorKey = oldDraft?.work?.profile ?? oldDraft?.interrupted?.profile
+  if (priorKey && priorKey !== analysisKey(next) && oldDraft) savedDrafts[priorKey] = oldDraft
+  const restored = savedDrafts[analysisKey(next)]
+  if (restored) delete savedDrafts[analysisKey(next)]
+  const draftPatch = { [field]: restored ?? oldDraft, savedDrafts }
+  if (analysisKey(game) === analysisKey(next)) return { ...next, ...draftPatch, queued: true }
   const key = analysisKey(next)
   const saved = game.savedAnalyses ?? []
   const snapshot = saved.find(item => analysisKey(item) === key)
@@ -514,9 +528,25 @@ function prepareAnalysis(game: Game, mode: Mode, options?: EngineOptions, comput
     mode: game.mode, methodology: game.methodology, options: game.options, compute: game.compute, reviews: game.reviews,
   }] : []
   return {
-    ...next, queued: true, reviews: snapshot?.reviews ?? [],
+    ...next, ...draftPatch, queued: true, reviews: snapshot?.reviews ?? [],
     savedAnalyses: [...saved.filter(item => ![key, analysisKey(game)].includes(analysisKey(item))), ...prior],
   }
+}
+
+function mergeDraft(local?: Draft, imported?: Draft) {
+  if (!local || !imported) return local ?? imported
+  if (local.previewVersion !== imported.previewVersion) return local
+  const preferred = local.instant.map((line, index) => (line?.depth ?? -1) >= (imported.instant[index]?.depth ?? -1))
+  const draft: Draft = {
+    ...local, instant: preferred.map((keep, index) => keep ? local.instant[index] : imported.instant[index]),
+    work: local.work ?? imported.work, interrupted: local.interrupted ?? imported.interrupted,
+  }
+  if (local.previewVersion === 1) draft.alternatives = preferred.map((keep, index) =>
+    (keep ? local.alternatives : imported.alternatives)?.[index] ?? null)
+  if (local.work?.profile === imported.work?.profile && local.work && imported.work) {
+    draft.work = { ...local.work, reviews: { ...imported.work.reviews, ...local.work.reviews } }
+  }
+  return draft
 }
 
 function validLine(value: Line) {
@@ -531,7 +561,7 @@ function readEngineOptions(value?: EngineOptions): EngineOptions | undefined {
     full: value.full === true,
     energy: value.energy === 'eco' || value.energy === 'turbo' ? value.energy : undefined,
     multiplier: [0.5, 1, 2, 3].includes(value.multiplier ?? 0) ? value.multiplier : undefined,
-    threads: value.threads === 1 ? 1 : undefined,
+    threads: value.threads === 1 || value.threads === 2 ? value.threads : undefined,
     workers: [1, 2, 3, 4].includes(value.workers ?? 0) ? value.workers : undefined,
     hash: value.hash === 16 || value.hash === 32 || value.hash === 64 ? value.hash : undefined,
     cache: [0, 500, 3000, 6000].includes(value.cache ?? -1) ? value.cache : undefined,
@@ -565,7 +595,7 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
       const restored: Game[] = []
       for (const row of json.games as Game[]) {
         if (!['chesscom', 'lichess', 'pgn'].includes(row.source) || typeof row.pgn !== 'string') throw new Error('Копия содержит некорректную партию.')
-        const game = await parsePgn(row.pgn, row.source, typeof row.owner === 'string' ? row.owner : undefined, typeof row.url === 'string' ? row.url : undefined, row.methodology !== 2)
+        const game = await parsePgn(row.pgn, row.source, typeof row.owner === 'string' ? row.owner : undefined, typeof row.url === 'string' ? row.url : undefined, (row.methodology ?? 1) < 2)
         if (row.id !== game.id) throw new Error('Контрольная сумма партии не совпадает.')
         const validReview = (item: Review, index: number) => !!item && item.index === index &&
           Object.hasOwn(categories, item.category) && ['w','b'].includes(item.color) && !item.preliminary &&
@@ -576,10 +606,14 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
         const validIndex = (index: number) => Number.isInteger(index) && index >= 0 && index < game.moves
         const validDraft = (draft?: Draft) => !draft || (draft.format === 1 && Array.isArray(draft.instant) &&
           draft.instant.length === game.moves + 1 && draft.instant.every(line => line === null || validLine(line)) &&
+          (!draft.alternatives || draft.previewVersion === 1 && Array.isArray(draft.alternatives) &&
+            draft.alternatives.length === game.moves + 1 && draft.alternatives.every(line => line === null || validLine(line))) &&
           (!draft.work || (typeof draft.work.profile === 'string' && Array.isArray(draft.work.critical) &&
             draft.work.critical.every(validIndex) && draft.work.reviews &&
             Object.entries(draft.work.reviews).every(([key, review]) => validIndex(Number(key)) && validReview(review, Number(key))))))
-        if (!validDraft(row.draft) || !validDraft(row.cloudDraft)) throw new Error('Копия содержит некорректный черновик анализа.')
+        if (!validDraft(row.draft) || !validDraft(row.cloudDraft) || row.savedDrafts &&
+          Object.entries(row.savedDrafts).some(([key, draft]) => !draft || !validDraft(draft) ||
+            key !== draft.work?.profile && key !== draft.interrupted?.profile)) throw new Error('Копия содержит некорректный черновик анализа.')
         if (row.reviews && !validReviews(row.reviews) || row.savedAnalyses && (!Array.isArray(row.savedAnalyses) ||
           row.savedAnalyses.some(item => !Object.hasOwn(budgets, item.mode) || !validReviews(item.reviews)))) {
           throw new Error('Копия содержит некорректный анализ.')
@@ -587,7 +621,10 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
         restored.push({ ...game, whiteElo: game.whiteElo ?? historicalRating(row.whiteElo), blackElo: game.blackElo ?? historicalRating(row.blackElo), timestamp: Number.isFinite(row.timestamp) ? row.timestamp : game.timestamp,
           mode: row.mode && Object.hasOwn(budgets, row.mode) ? row.mode : undefined, reviews: row.reviews, draft: row.draft,
           cloudDraft: row.cloudDraft, compute: row.compute === 'cloud' ? 'cloud' : undefined,
-          methodology: row.methodology === 2 ? 2 : 1, options: readEngineOptions(row.options), savedAnalyses: row.savedAnalyses })
+          methodology: row.methodology === 3 || row.methodology === 2 ? row.methodology : 1, options: readEngineOptions(row.options), savedAnalyses: row.savedAnalyses, savedDrafts: row.savedDrafts,
+          autoPreviewPaused: row.autoPreviewPaused === true, loadPaused: row.loadPaused === true,
+          localElapsedMs: Number.isFinite(row.localElapsedMs) ? row.localElapsedMs : undefined,
+          queueSource: ['auto', 'cloud', 'local'].includes(row.queueSource ?? '') ? row.queueSource : undefined })
 
       }
       const storage = await db
@@ -602,12 +639,10 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
           const imported = [...(game.savedAnalyses ?? []), ...(game.mode && game.reviews ? [{
             mode: game.mode, methodology: game.methodology, options: game.options, compute: game.compute, reviews: game.reviews,
           }] : [])]
-          const instant = game.draft?.instant.map((line, index) => {
-            const local = previous.draft?.instant[index]
-            return (local?.depth ?? -1) >= (line?.depth ?? -1) ? local ?? null : line
-          })
-          const draft = instant ? { format: 1 as const, instant, work: previous.draft ? previous.draft.work : game.draft?.work } : previous.draft
-          let update = { ...previous, draft, cloudDraft: previous.cloudDraft ?? game.cloudDraft, whiteElo: previous.whiteElo ?? game.whiteElo, blackElo: previous.blackElo ?? game.blackElo }
+          const draft = mergeDraft(previous.draft, game.draft)
+          const savedDrafts = { ...game.savedDrafts }
+          for (const [key, value] of Object.entries(previous.savedDrafts ?? {})) savedDrafts[key] = mergeDraft(value, savedDrafts[key])!
+          let update = { ...previous, draft, savedDrafts, cloudDraft: mergeDraft(previous.cloudDraft, game.cloudDraft), whiteElo: previous.whiteElo ?? game.whiteElo, blackElo: previous.blackElo ?? game.blackElo }
           for (const item of imported) {
             const key = analysisKey(item)
             if (key === existingKey) {
@@ -630,8 +665,8 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
       setGames(await storage.getAll('games'))
       setPractice(await storage.getAll('practice'))
       if (json.settings && typeof json.settings.nickname === 'string' && ['system','light','dark'].includes(json.settings.theme) && Object.hasOwn(budgets, json.settings.mode)) {
-        onSettings({ nickname: json.settings.nickname, theme: json.settings.theme, mode: json.settings.mode, engine: readEngineOptions(json.settings.engine),
-          computeSource: ['local', 'cloud', 'auto'].includes(json.settings.computeSource) ? json.settings.computeSource : 'local',
+        onSettings({ nickname: json.settings.nickname, theme: json.settings.theme, mode: reviewMode(json.settings.mode), engine: readEngineOptions(json.settings.engine),
+          computeSource: ['local', 'cloud', 'auto'].includes(json.settings.computeSource) ? json.settings.computeSource : adaptiveMode(json.settings.mode) ? 'auto' : 'local',
           autoPreview: [1, 3, 5].includes(json.settings.autoPreview) ? json.settings.autoPreview : 0,
           board: ['sage', 'navy', 'gold'].includes(json.settings.board) ? json.settings.board : 'sage' })
       }
@@ -659,26 +694,26 @@ function Preferences({ settings, onSettings, setGames, setPractice, offline }: {
     </section>
     <section className="panel"><h2>Производительность и батарея</h2>
       <label className="field">Режим анализа по умолчанию<select value={settings.mode} onChange={event => onSettings({ ...settings, mode: event.target.value as Mode })}>
-        {Object.entries(budgets).map(([key, value]) => <option value={key} key={key}>{value.label}</option>)}</select></label>
-      <label className="field">Бюджет Professional<select value={settings.engine?.multiplier ?? 1} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, multiplier: Number(event.target.value) } })}>{[0.5, 1, 2, 3].map(value => <option key={value} value={value}>{value}×</option>)}</select></label>
+        {Object.entries(reviewModes).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></label>
+
       <label className="field">Предварительный анализ последних партий<select disabled={settings.engine?.energy === 'eco'} value={settings.engine?.energy === 'eco' ? 0 : settings.autoPreview ?? 0} onChange={event =>
         onSettings({ ...settings, autoPreview: Number(event.target.value) })}>
         <option value={0}>Выключен</option>{[1, 3, 5].map(count => <option value={count} key={count}>{count} · пока приложение открыто</option>)}
       </select></label>
-      <label className="field">Источник вычислений<ComputeSelect value={settings.computeSource ?? 'local'}
+      <label className="field">Источник вычислений<ComputeSelect value={settings.computeSource ?? 'auto'}
         onChange={computeSource => onSettings({ ...settings, computeSource })} /></label>
-      <p className="muted">На устройстве анализ доступен офлайн. Облако экономит заряд и использует выделенную квоту. Автоматический режим учитывает доступность, режим разбора и скорость устройства.</p>
-      {deviceCapabilities().mobile && (deviceCapabilities().constrained || settings.engine?.energy === 'eco') &&
-        <p className="muted">Для экономии заряда выберите Mobile Lite. Это облегчённый разбор с одним вариантом.</p>}
-      <p className="muted">{cloudBlocker(undefined, 'quick', cloud) ?? cloudState(cloud)}</p>
+      <p className="muted">{cloudBlocker(undefined, 'smart', cloud) ?? cloudState(cloud)}</p>
       <label className="field">Энергопотребление<select value={settings.engine?.energy ?? 'balanced'} onChange={event => onSettings({
         ...settings, engine: { ...settings.engine, energy: event.target.value as Energy },
       })}><option value="eco">Eco</option><option value="balanced">Balanced</option><option value="turbo">Turbo</option></select></label>
       <p className="muted">Профиль применяется при следующем запуске или продолжении разбора.</p>
       {settings.engine?.energy === 'turbo' && <p className="notice">Turbo может ускорить разряд аккумулятора и повысить нагрев.</p>}
+      <details className="analysis-engine"><summary>Технические настройки</summary>
+      <label className="field">Бюджет глубокого разбора<select value={Math.max(1, settings.engine?.multiplier ?? 1)} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, multiplier: Number(event.target.value) } })}>{[1, 2, 3].map(value => <option key={value} value={value}>{value}×</option>)}</select></label>
       <label className="field">Параллелизм Lite<select value={settings.engine?.threads ?? 'auto'} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, threads: event.target.value === '1' ? 1 : undefined } })}><option value="auto">Авто</option><option value="1">Один поток</option></select></label>
       <label className="field">Память Stockfish Hash<select value={settings.engine?.hash ?? 'auto'} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, hash: event.target.value === 'auto' ? undefined : Number(event.target.value) as EngineOptions['hash'] } })}><option value="auto">Авто</option>{[16, 32, 64].map(value => <option key={value} value={value}>{value} МБ</option>)}</select></label>
       <label className="action-row"><input type="checkbox" checked={settings.engine?.full ?? false} onChange={event => onSettings({ ...settings, engine: { ...settings.engine, full: event.target.checked } })} /> Stockfish Full · около 95 МиБ при первом запуске</label>
+      </details>
     </section>
     <section className="panel"><h2>Хранение и установка</h2>
       <label className="field">Лимит кэша позиций<select value={settings.engine?.cache ?? 3000} onChange={event => {

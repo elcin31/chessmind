@@ -8,9 +8,18 @@ import { test } from 'node:test'
 import { promisify } from 'node:util'
 import type { Redis } from '@upstash/redis'
 import { engineHandler } from '../server/engine/function'
-import { RedisAdmission } from '../server/engine/quota'
+import { productionAdmission, RedisAdmission } from '../server/engine/quota'
 import { cloudRequest, ending, eventsFrom } from './cloudFixtures'
 import { opera } from './fixtures'
+
+
+test('Production принимает целую пару переменных Upstash или Vercel KV', () => {
+  const url = 'https://test-only.upstash.io'
+  const token = 'test-only'
+  assert.ok(productionAdmission({ UPSTASH_REDIS_REST_URL: url, UPSTASH_REDIS_REST_TOKEN: token }))
+  assert.ok(productionAdmission({ KV_REST_API_URL: url, KV_REST_API_TOKEN: token }))
+  assert.equal(productionAdmission({ UPSTASH_REDIS_REST_URL: url, KV_REST_API_TOKEN: token }), undefined)
+})
 
 const cli = process.env.CM_REDIS_CLI ?? 'redis-cli'
 const server = process.env.CM_REDIS_SERVER ?? 'redis-server'
@@ -105,23 +114,23 @@ test('Redis real: общий бюджет, блокировка, повторы,
       const upstream = async () => Response.json({ id: 'Abcdef12', variant: 'standard', status: 'mate', pgn })
       const guard = () => new RedisAdmission(redis, 'test', res)
       const handler = () => engineHandler({ admission: guard(), enabled: () => true, request: upstream, loadBook: async () => ({}) })
-      const request = async (mode: 'quick' | 'standard') => {
+      const request = async (mode: 'smart' | 'standard') => {
         const base = await cloudRequest(pgn, mode)
         base.headers.set('X-Vercel-Forwarded-For', '192.0.2.2')
         base.headers.set('X-ChessMind-Session', crypto.randomUUID())
         return base
       }
-      const result = await eventsFrom(await handler()(await request('quick')))
+      const result = await eventsFrom(await handler()(await request('smart')))
       assert.equal(result.at(-1)?.type, 'done')
       assert.equal(result.at(-1)?.reviews.at(-1).after.kind, 'mate')
-      const cached = await eventsFrom(await handler()(await request('quick')))
+      const cached = await eventsFrom(await handler()(await request('smart')))
       assert.equal(cached[0].cached, true)
       assert.deepEqual(cached.at(-1)?.reviews, result.at(-1)?.reviews)
       assert.equal((await handler()(await request('standard'))).status, 429)
       assert.deepEqual(await guard().status(), { remainingCpuMs: 0, busy: false })
       process.kill()
       await done
-      const response = await handler()(await request('quick'))
+      const response = await handler()(await request('smart'))
       assert.equal(response.status, 503)
     })
   } finally {

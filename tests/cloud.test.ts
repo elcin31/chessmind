@@ -50,7 +50,7 @@ test('запуск только для подтверждённой архиво
 test('поток реального Stockfish WASM, повтор и одновременный запрос', async () => {
   const admission = sampleAdmission()
   const handle = engineHandler({ admission, enabled: () => true, request: trusted(), loadBook: blankBook })
-  const first = await handle(await cloudRequest(sample, 'quick'))
+  const first = await handle(await cloudRequest(sample, 'smart'))
   assert.equal(first.status, 200)
   assert.equal((await handle(await cloudRequest(sample, 'standard'))).status, 429)
   const events = await eventsFrom(first)
@@ -63,7 +63,7 @@ test('поток реального Stockfish WASM, повтор и одновр
   assert.equal(result.reviews.at(-1).after.kind, 'mate')
   assert.deepEqual(result.reviews.at(-1).after.wdl, [1000, 0, 0])
   assert.ok(result.metrics.cpuMs > 0)
-  const replay = await eventsFrom(await handle(await cloudRequest(sample, 'quick')))
+  const replay = await eventsFrom(await handle(await cloudRequest(sample, 'smart')))
   assert.equal(replay[0].cached, true)
   assert.deepEqual(replay.at(-1).reviews, result.reviews)
   assert.deepEqual(await admission.status(), {

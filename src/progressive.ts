@@ -1,18 +1,21 @@
 import { Chess, type Square } from 'chess.js'
-import { analysisKey, gameMoves, uci, type Game, type Mode } from './game.js'
-import { analyzeMove, expectation, moveAccuracy, positionsFor, sacrifice, type Line, type Review } from './review.js'
+import { adaptiveMode, analysisKey, gameMoves, uci, type Game, type Mode } from './game.js'
+import { analyzeMove, expectation, winProbability, moveAccuracy, positionsFor, sacrifice, type Line, type Review } from './review.js'
 import type { PoolStatus } from './searchPool.js'
 import type { EngineOptions } from './game.js'
+import { adaptiveBudgets } from './stockfish.js'
 import type { Engine } from './engine.js'
 
 export const stageLabels = {
   instant: 'Предварительный разбор',
   critical: 'Уточнение критических моментов',
-  final: 'Глубокий анализ',
+  final: 'Завершение разбора',
 } as const
 export type Stage = keyof typeof stageLabels
 export type Draft = {
   format: 1
+  previewVersion?: 1
+  alternatives?: Array<Line | null>
   instant: Array<Line | null>
   work?: { profile: string; critical: number[]; reviews: Record<number, Review> }
   interrupted?: { profile: string; index: number; reason: 'time' | 'load'; line?: Line }
@@ -41,7 +44,7 @@ export function inspectDraft(game: Game, draft: Draft, index: number, moves = ga
   const cpLoss = before.kind === 'cp' && played.kind === 'cp' ? Math.max(0, (before.value - played.value) * (move.color === 'w' ? 1 : -1)) : null
   const category = loss >= 26 ? 'blunder' : loss >= 15 ? 'mistake' : loss >= 7 || (cpLoss ?? 0) >= 75 ? 'inaccuracy' : matching ? 'best' : 'good'
   return {
-    index, color: move.color, before, after, played, lines: [before], loss, cpLoss, category, preliminary: true,
+    index, color: move.color, before, after, played, lines: draft.alternatives?.[index] ? [before, draft.alternatives[index]!] : [before], loss, cpLoss, category, preliminary: true,
     accuracy: moveAccuracy(loss), phase: index < Math.max(14, game.book) ? 'opening' : 'middle',
     explanation: 'Предварительная оценка позиции после хода. Ход и альтернативы будут сопоставлены на глубине выбранного режима.',
     critical: loss >= 12 || before.kind !== after.kind, depth: Math.min(before.depth, after.depth), forced,
@@ -72,6 +75,32 @@ function criticalPositions(game: Game, draft: Draft, moves: ReturnType<typeof ga
   })
   return scored.sort((a, b) => b.risk - a.risk || a.index - b.index)
     .slice(0, Math.max(6, Math.ceil(moves.length / 4))).map(item => item.index)
+}
+
+function adaptivePositions(game: Game, mode: 'smart' | 'deep-review', draft: Draft, moves: ReturnType<typeof gameMoves>, positions: ReturnType<typeof positionsFor>) {
+  const ranked = moves.flatMap((move, index) => {
+    const { before, after, loss, cpLoss, forced } = inspectDraft(game, draft, index, moves)!
+    if (forced) return []
+    const second = draft.alternatives?.[index]
+    const gap = second ? expectation(before, move.color, !!before.wdl && !!second.wdl) -
+      expectation(second, move.color, !!before.wdl && !!second.wdl) : 0
+    const winBefore = winProbability(before, move.color), winAfter = winProbability(after, move.color)
+    const swing = winBefore === undefined || winAfter === undefined ? loss : Math.abs(winBefore - winAfter)
+    const board = new Chess(move.before)
+    const mating = before.kind === 'mate' || after.kind === 'mate'
+    const sacrificeCandidate = sacrifice(move, after)
+    const uncertain = !before.stable || !after.stable || !second?.stable
+    const different = before.pv[0] !== uci(move)
+    const rescue = gap >= 12 || board.isCheck() && (positions[index].legal ?? 0) <= 5
+    const risk = Math.max(loss, swing * .6) + Math.min(12, (cpLoss ?? 0) / 12) +
+      (uncertain ? 7 : 0) + (rescue ? 13 : 0) + (different ? 3 : 0) +
+      (move.captured || move.promotion ? 4 : 0) + Math.min(6, (positions[index].legal ?? 0) / 8)
+    return [{ index, risk, essential: mating || sacrificeCandidate || rescue || loss >= 15 }]
+  })
+  const cap = Math.max(3, Math.ceil(moves.length * (mode === 'smart' ? .18 : .28)))
+  return ranked.filter(item => item.essential || item.risk >= 14)
+    .sort((a, b) => Number(b.essential) - Number(a.essential) || b.risk - a.risk || a.index - b.index)
+    .filter((item, index) => item.essential || index < cap).map(item => item.index)
 }
 
 type WorkPool = {
@@ -115,15 +144,21 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
   }
   const positions = positionsFor(game, moves)
   const prior = validDraft(game)
+  const adaptive = adaptiveMode(mode)
+  const modernPreview = adaptive || previewOnly
+  const compatiblePreview = prior && (!modernPreview || prior.previewVersion === 1)
   const profile = analysisKey(game)
   const oldWork = prior?.work?.profile === profile ? prior.work : undefined
   const draft: Draft = {
-    format: 1, instant: prior ? [...prior.instant] : positions.map(() => null),
+    format: 1, instant: compatiblePreview ? [...prior.instant] : positions.map(() => null),
+    ...(modernPreview ? { previewVersion: 1 as const, alternatives: prior?.previewVersion === 1 && prior.alternatives
+      ? [...prior.alternatives] : positions.map(() => null) } : {}),
     ...(oldWork ? { work: { ...oldWork, reviews: { ...oldWork.reviews } } } : {}),
   }
   const options: EngineOptions = !previewOnly && mode === 'lite'
     ? { ...game.options, full: false, threads: 1, workers: 1, hash: 16 }
-    : game.options ?? {}
+    : mode === 'deep-review' && (game.options?.multiplier ?? 1) < 1
+      ? { ...game.options, multiplier: 1 } : game.options ?? {}
   const retry = prior?.interrupted?.profile === profile ? prior.interrupted : undefined
   draft.interrupted = retry
   const previewOptions = { ...options, full: false }
@@ -146,7 +181,9 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
       const position = positions[index]
       const legal = position.legal ?? 0
       const nodes = Math.min(8500, 3000 + legal * 120)
-      draft.instant[index] = (await pool.at(index).evaluate(position, 'quick', false, undefined, 9, nodes, 1))[0]
+      const lines = await pool.at(index).evaluate(position, 'quick', false, undefined, 9, nodes, modernPreview ? 2 : 1, modernPreview)
+      draft.instant[index] = lines[0]
+      if (draft.alternatives) draft.alternatives[index] = lines[1] ?? null
       instant++
       await publish('instant')
     })
@@ -158,10 +195,10 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
       pool = await makePool(options)
     }
     if (!draft.work) {
-      const candidates = criticalPositions(game, draft, moves)
+      const candidates = adaptive ? adaptivePositions(game, mode, draft, moves, positions) : criticalPositions(game, draft, moves)
       draft.work = {
         profile, critical: mode === 'lite' ? candidates.slice(0, Math.min(6, Math.ceil(moves.length / 10))) : candidates,
-        reviews: Object.fromEntries((game.reviews ?? []).map(review => [review.index, review])),
+        reviews: Object.fromEntries((game.reviews ?? []).filter(review => !review.preliminary).map(review => [review.index, review])),
       }
       checked = Object.keys(draft.work.reviews).length
       criticalDone = draft.work.critical.filter(index => !!draft.work!.reviews[index]).length
@@ -172,7 +209,20 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
       // Priority also rechecks a preview with serious, contradictory evidence.
       const preview = inspectDraft(game, draft, index, moves)
       const prioritize = stage === 'critical' && !!preview && (mode === 'lite' || preview.loss >= 23 || preview.before.kind !== preview.after.kind)
-      const { review } = await analyzeMove(game, mode, pool.at(index), index, moves, positions, undefined, false, prioritize)
+      const strong = stage === 'critical' && adaptive
+      const searchMode = adaptive ? adaptiveBudgets[mode][strong ? 'critical' : 'base'] : mode
+      const engine = pool.at(index)
+      const search: Pick<Engine, 'evaluate'> = adaptive
+        ? { evaluate: (position, mode, critical, only, depth, nodes, lines) =>
+          engine.evaluate(position, mode, critical, only, depth, nodes, lines, true) } : engine
+      const previewAfter = draft.instant[index + 1]!
+      const options = adaptive ? { preview: previewAfter, strong } : undefined
+      let { review } = await analyzeMove(game, searchMode, search, index, moves, positions, undefined, strong, prioritize, options)
+      if (adaptive && !strong && !review.forced && review.critical) {
+        const upgraded = await analyzeMove(game, adaptiveBudgets[mode].critical, search, index, moves, positions, undefined,
+          true, true, { preview: previewAfter, strong: true })
+        review = upgraded.review
+      }
       work.reviews[index] = review
       checked++
       if (stage === 'critical') criticalDone++

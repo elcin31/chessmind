@@ -83,14 +83,17 @@ export function assess(lines: Line[], played: Line, move: Move, after: Line, boo
   const playedScore = expectation(played, color, wdl)
   const loss = Math.max(0, beforeScore - playedScore)
   const cpLoss = best.kind === 'cp' && played.kind === 'cp' ? Math.max(0, fromMover(best, color) - fromMover(played, color)) : null
-  const gap = lines[1] ? expectation(lines[0], color, !!lines[0].wdl && !!lines[1].wdl) - expectation(lines[1], color, !!best.wdl && !!lines[1].wdl) : 0
+  const compareWdl = !!lines[0].wdl && !!lines[1]?.wdl
+  const gap = lines[1] ? expectation(lines[0], color, compareWdl) - expectation(lines[1], color, compareWdl) : 0
   const top = lines[0].pv[0] === uci(move)
   const forced = (legal ?? new Chess(move.before).perft(1)) === 1
   const lostMate = best.kind === 'mate' && fromMover(best, color) > 0 && !(played.kind === 'mate' && fromMover(played, color) > 0)
   const allowsMate = played.kind === 'mate' && fromMover(played, color) < 0 && !(best.kind === 'mate' && fromMover(best, color) < 0)
   const equivalent = (cpLoss !== null && cpLoss <= 15 && loss <= 2) ||
     (best.kind === 'mate' && played.kind === 'mate' && Math.sign(best.value) === Math.sign(played.value) && Math.abs(best.value) === Math.abs(played.value))
-  const reliable = forced || best.depth >= 12 && played.depth >= 12 && Math.abs(best.depth - played.depth) <= 1
+  const comparable = beforeScore + 1 >= playedScore &&
+    (best.kind !== 'cp' || played.kind !== 'cp' || fromMover(best, color) + 15 >= fromMover(played, color))
+  const reliable = forced || comparable && best.depth >= 12 && played.depth >= 12 && Math.abs(best.depth - played.depth) <= 1
     && best.stable === true && played.stable === true
   const alternatives = lines.slice(1).filter(line => {
     const useWdl = !!lines[0].wdl && !!line.wdl
@@ -109,7 +112,7 @@ export function assess(lines: Line[], played: Line, move: Move, after: Line, boo
   let category: Category
   if (forced) category = 'best'
   else if (strongSacrifice) category = 'brilliant'
-  else if (checked && reliable && lines[1]?.stable && unique) category = 'great'
+  else if (checked && reliable && lines[0].stable && lines[1]?.stable && lines[1].depth >= 12 && unique) category = 'great'
   else if (allowsMate && (reliable || loss >= 15)) category = 'blunder'
   else if (lostMate && (reliable || loss >= 8) && playedScore <= 85 ||
     beforeScore >= 72 && playedScore <= 61 && loss >= 14) category = 'miss'
@@ -163,7 +166,8 @@ export function positionsFor(game: Game, moves: Move[]) {
 type Root = { lines: Line[]; deep: boolean }
 
 export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, 'evaluate'>, index: number,
-  moves: Move[], positions: Position[], historyRoot?: Root, force = false, prioritized = false) {
+  moves: Move[], positions: Position[], historyRoot?: Root, force = false, prioritized = false,
+  adaptive?: { preview: Line; strong: boolean }) {
   const move = moves[index]
   const notation = uci(move)
   const current = positions[index], child = positions[index + 1]
@@ -175,6 +179,13 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
     const inMulti = root.lines.find(line => line.pv[0] === notation)
     if (inMulti || !best.pv.length) return { best, played: inMulti ?? best }
     const search = async (move: string, depth: number) => (await engine.evaluate(current, mode, root.deep, move, depth))[0]
+    if (adaptive) {
+      // Compare both candidates at one root and one completed MultiPV iteration.
+      const paired = await engine.evaluate(current, mode, root.deep, [best.pv[0], notation], best.depth)
+      const baseline = paired.find(line => line.pv[0] === best.pv[0])
+      const candidate = paired.find(line => line.pv[0] === notation)
+      if (baseline && candidate) return { best: baseline, played: candidate }
+    }
     const played = await search(notation, best.depth)
     if (lite) return { best, played }
     const sameKind = played.kind === best.kind
@@ -196,7 +207,10 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
   let pair = await compare()
   const classify = (after: Line, verified: boolean) =>
     assess(root.lines, pair.played, move, after, index < game.book, verified, pair.best, current.legal)
-  const baseChild = { lines: await engine.evaluate(child, mode, force), deep: force }
+  const verifyChild = force && (!adaptive || mode === 'professional')
+  const baseChild = adaptive && !verifyChild
+    ? { lines: [adaptive.preview], deep: false }
+    : { lines: await engine.evaluate(child, mode, verifyChild), deep: verifyChild }
   const preliminary = classify(baseChild.lines[0], false)
   const childLine = baseChild.lines[0]
   const expressDisagreement = mode === 'quick' && pair.played.depth > 0 && childLine.depth > 0 &&
@@ -205,16 +219,21 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
       expectation(pair.played, move.color, !!pair.played.wdl && !!childLine.wdl) -
       expectation(childLine, move.color, !!pair.played.wdl && !!childLine.wdl) >= 10)
   const critical = force || !preliminary.forced && !!root.lines[0].pv.length &&
-    (lite ? prioritized : prioritized || expressDisagreement || preliminary.loss >= 7 || preliminary.gap >= 14 ||
+    (adaptive ? preliminary.loss >= 15 || preliminary.gap >= 18 || preliminary.lostMate || preliminary.allowsMate ||
+      sacrifice(move, baseChild.lines[0]) : lite ? prioritized : prioritized || expressDisagreement || preliminary.loss >= 7 || preliminary.gap >= 14 ||
       preliminary.lostMate || preliminary.allowsMate || sacrifice(move, baseChild.lines[0]))
-  if (critical && !root.deep) {
+  if (critical && !root.deep && !adaptive) {
     root = { lines: await engine.evaluate(current, mode, true), deep: true }
     pair = await compare()
   }
 
   let next = baseChild
   let after = next.lines[0]
-  if (critical && !lite && !force && !move.captured && !preliminary.forced) {
+  if (adaptive?.strong && !next.deep && (after.kind === 'mate' || pair.played.kind === 'mate' || sacrifice(move, after))) {
+    next = { lines: await engine.evaluate(child, mode, true), deep: true }
+    after = next.lines[0]
+  }
+  if (!adaptive && critical && !lite && !force && !move.captured && !preliminary.forced) {
     const candidate = classify(after, true)
     const canBeBrilliant = candidate.reliable && candidate.loss <= 1 && (candidate.cpLoss === null || candidate.cpLoss <= 12) &&
       candidate.gap >= 5 && expectation(pair.played, move.color) >= 65 &&
@@ -232,11 +251,20 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
     const value = matesWithMove ? played.value - Math.sign(played.value) : played.value
     if (value !== 0 || played.kind !== 'mate') after = { ...played, value, depth: played.depth - 1, pv: played.pv.slice(1) }
   }
-  let result = classify(after, critical && !lite)
+  let result = classify(after, (adaptive ? adaptive.strong : critical) && !lite)
   if (result.category === 'brilliant' && !next.deep) {
     next = { lines: await engine.evaluate(child, mode, true), deep: true }
     after = next.lines[0]
     result = classify(after, critical)
+  }
+  if (adaptive && !adaptive.strong && !critical && pair.best.kind === 'cp' && pair.played.kind === 'cp' &&
+    pair.best.depth >= 9 && pair.best.depth === pair.played.depth && pair.best.stable && pair.played.stable &&
+    (result.cpLoss ?? 0) <= 45 && result.loss <= 3 && fromMover(pair.best, move.color) + 15 >= fromMover(pair.played, move.color)) {
+    result = { ...result, reliable: true }
+  }
+  if (adaptive && (!adaptive.strong && (result.lostMate || result.allowsMate || result.loss >= 15) ||
+    adaptive.strong && (result.lostMate || result.allowsMate) && !after.stable && !terminal && after.depth !== 0)) {
+    result = { ...result, reliable: false }
   }
   const phase = phaseFor(move, index, game.book)
   const rationale = explain(move, pair.best, pair.played, after, result, phase)
@@ -259,7 +287,7 @@ export function average(values: number[]) {
 }
 export function summarize(reviews: Review[], color?: Color, phase?: Phase) {
   const selection = reviews.filter(review => (!color || review.color === color) && (!phase || review.phase === phase))
-  const scored = selection.filter(review => !review.forced)
+  const scored = selection.filter(review => !review.forced && !review.preliminary)
   const precision = scored.map(review => review.accuracy)
   const arithmetic = average(precision)
   const harmonic = precision.length ? (precision.some(value => value === 0) ? 0 : precision.length / precision.reduce((sum, value) => sum + 1 / value, 0)) : undefined
@@ -267,7 +295,7 @@ export function summarize(reviews: Review[], color?: Color, phase?: Phase) {
   const cp = scored.flatMap(review => review.cpLoss === null ? [] : [review.cpLoss])
   return { accuracy: arithmetic === undefined || harmonic === undefined ? undefined : (arithmetic + harmonic) / 2,
     acpl: average(cp), esl: average(scored.map(move => move.loss)),
-    deviation: arithmetic === undefined ? undefined : Math.sqrt(average(precision.map(value => (value - arithmetic) ** 2))!), cpSample: cp.length, counts, sample: scored.length }
+    deviation: arithmetic === undefined ? undefined : Math.sqrt(average(precision.map(value => (value - arithmetic) ** 2))!), cpSample: cp.length, counts, sample: scored.length, limited: scored.filter(review => review.reliable === false).length }
 }
 
 export function estimatedRating(game: Game, color: Color, library: Game[]) {

@@ -141,7 +141,7 @@ for (const mode of profiles) {
     await page.getByRole('button', { name: 'Импортировать PGN' }).click()
     for (const [, name] of games) {
       await page.locator('.recent-list button').filter({ hasText: name }).click()
-      await page.getByRole('combobox', { name: 'Глубина анализа' }).selectOption(mode)
+      await page.getByRole('combobox', { name: /^(Тип разбора|Глубина анализа)$/ }).selectOption(mode)
       await page.evaluate(() => Object.assign(window.bench, {
         searches: 0, nodes: 0, depths: 0, peakWorkers: 0, peakThreads: 0, phases: {}, activeMs: 0, longestMs: 0, lag: [], start: performance.now(),
       }))
@@ -174,9 +174,9 @@ for (const mode of profiles) {
             return { color, accuracy: (harmonic + mean(accuracy)) / 2,
               acpl: mean(reviews.flatMap(item => item.cpLoss === null ? [] : [item.cpLoss])), esl: mean(reviews.map(item => item.loss)) }
           })
-          const plies = game.reviews.map(({ before, played, after, category, depth, critical, explanation, motif }) =>
+          const plies = game.reviews.map(({ before, played, after, category, depth, critical, reliable, explanation, motif }) =>
             ({ before: [before.kind, before.value], played: [played.kind, played.value], after: [after.kind, after.value],
-              best: before.pv[0], wdl: played.wdl, category, depth, critical, explanation, motif }))
+              best: before.pv[0], wdl: played.wdl, category, depth, critical, reliable, explanation, motif }))
           return { ...window.bench, metrics, plies, engine: game.reviews.find(item => item.before.engine)?.before.engine }
         }, name)
         const { lag, ...measurements } = data
@@ -188,6 +188,11 @@ for (const mode of profiles) {
           previewSeconds: data.phases.preview === undefined ? undefined : data.phases.preview / 1000,
           criticalSeconds: data.phases.final === undefined || data.phases.critical === undefined ? undefined : (data.phases.final - data.phases.critical) / 1000,
           nps: Math.round(data.nodes / seconds), idlePssKiB: idle.pss, peakPssKiB: Math.max(peakPss, final.pss), ...measurements }
+        const warmStart = performance.now()
+        await page.reload()
+        await page.getByRole('button', { name: 'Анализ готов' }).waitFor({ timeout: 15_000 })
+        result.cachedMs = performance.now() - warmStart
+        result.cachedSearches = await page.evaluate(() => window.bench.searches)
         appendFileSync(output, JSON.stringify(result) + '\n')
         console.log(mode, name, seconds.toFixed(1) + 's', 'preview=' + result.previewSeconds?.toFixed(2), 'workers=' + data.peakWorkers, data.searches + ' searches', data.nodes + ' nodes')
       } finally { clearInterval(sample) }

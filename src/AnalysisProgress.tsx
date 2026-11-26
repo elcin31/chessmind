@@ -61,9 +61,10 @@ export function AnalysisProgress({ id, initial, checked, total, running, queued 
       {live?.eta !== undefined && live.eta > 0 && <span>До конца этапа ≈ {live.eta >= 60 ? Math.ceil(live.eta / 60) + ' мин' : live.eta + ' с'}</span>}
     </div>
     {live?.search && live.search.workers > 0 && <details className="analysis-engine" aria-label="Параметры поиска">
-      <summary>Stockfish · {live.search.nps.toLocaleString('ru-RU')} узлов/с</summary>
+      <summary>Диагностика Stockfish</summary>
       <div className="analysis-counts"><span>Worker {live.search.workers}</span>
         <span>Потоки {live.search.threads}</span>
+        <span>{live.search.nps.toLocaleString('ru-RU')} узлов/с</span>
         {live.search.depth !== undefined && <span>Достигнутая глубина {live.search.depth}</span>}</div>
     </details>}
   </div>

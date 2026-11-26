@@ -187,7 +187,7 @@ export class Engine {
     this.initialized = true
   }
 
-  async evaluate(position: Position, mode: Mode, critical = false, only?: string | readonly string[], targetDepth?: number, targetNodes?: number, maxLines?: number): Promise<Line[]> {
+  async evaluate(position: Position, mode: Mode, critical = false, only?: string | readonly string[], targetDepth?: number, targetNodes?: number, maxLines?: number, independent = false): Promise<Line[]> {
     this.lastWork = undefined
     this.signal.throwIfAborted()
     const parameters = searchParameters(position, mode, this.options, critical, only, targetDepth, targetNodes, maxLines)
@@ -195,7 +195,7 @@ export class Engine {
     const { depth, nodes, count, choices, history, turn } = parameters
     const limit = this.options.cache ?? 3000
     let config = this.configured ??= await deviceConfiguration(this.options)
-    const keyFor = () => JSON.stringify(['review:2:stockfish:19.0.1', config.full, config.threads, config.hash, depth, nodes, count, choices, history])
+    const keyFor = () => JSON.stringify([independent ? 'review:3:stockfish:19.0.1' : 'review:2:stockfish:19.0.1', config.full, config.threads, config.hash, depth, nodes, count, choices, history])
     const cached = async (key: string) => {
       const recent = this.recent.get(key)
       if (recent) return recent
@@ -231,10 +231,11 @@ export class Engine {
       commands.push('setoption name MultiPV value ' + count)
       session.count = count
     }
-    if (session.position !== history) {
+    if (independent || session.position !== history) {
       commands.push('position fen ' + history)
       session.position = history
     }
+    if (independent) await this.exchange(['ucinewgame', 'isready'], 'readyok', 10_000)
     commands.push('go depth ' + depth + ' nodes ' + nodes + (choices ? ' searchmoves ' + choices : ''))
     const output = collectLines(count, turn, engineName(config))
     // UCI depth and nodes bound the same search. A client wall limit is distinct

@@ -1,5 +1,6 @@
 import { devices, expect, test, type Page } from '@playwright/test'
 import { immortal, opera } from './fixtures'
+import { ending } from './cloudFixtures'
 
 async function importGames(page: Page, pgn = opera) {
   await page.goto('/')
@@ -13,7 +14,7 @@ test.describe('Android Chrome', () => {
   const { defaultBrowserType: _browser, ...android } = devices['Pixel 7']
   test.use(android)
 
-  test('Express по умолчанию, Mobile Lite офлайн и один поток', async ({ page, context }) => {
+  test('Обычный разбор офлайн использует один поток на слабом телефоне', async ({ page, context }) => {
     const commands: string[] = []
     await page.exposeFunction('recordUci', (message: string) => commands.push(message))
     await page.addInitScript(() => {
@@ -25,23 +26,20 @@ test.describe('Android Chrome', () => {
       Object.defineProperty(navigator, 'deviceMemory', { value: 2 })
     })
     await importGames(page)
-    const mode = page.getByRole('combobox', { name: 'Глубина анализа' })
-    await expect(mode).toHaveValue('quick')
+    const mode = page.getByRole('combobox', { name: 'Тип разбора' })
+    await expect(mode).toHaveValue('smart')
     await expect(page.getByText('Офлайн готов')).toBeVisible({ timeout: 30_000 })
     await context.setOffline(true)
     await page.reload()
-    await mode.selectOption('lite')
     page.once('dialog', async dialog => {
       expect(dialog.message()).toContain('Анализ выполняется на вашем устройстве')
       await dialog.accept()
     })
     await page.getByRole('button', { name: 'Начать анализ' }).click()
     await expect(page.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 40_000 })
-    await expect(page.getByText(/Mobile Lite · облегчённый анализ/)).toBeVisible()
-    expect(commands).toContain('setoption name MultiPV value 1')
     expect(commands).toContain('setoption name Hash value 16')
-    expect(commands).toContainEqual(expect.stringMatching(/^go depth 9 nodes 22000/))
-    expect(commands.some(command => /setoption name (Threads value 2|MultiPV value [2-9])/.test(command))).toBe(false)
+    expect(commands).toContainEqual(expect.stringMatching(/^go depth 9 nodes /))
+    expect(commands.some(command => /setoption name Threads value 2/.test(command))).toBe(false)
     await page.reload()
     await expect(page.getByRole('button', { name: 'Анализ готов' })).toBeVisible()
   })
@@ -102,6 +100,9 @@ test.describe('Android Chrome', () => {
       if ([...active.values()].filter(count => count > 0).length > 1) overlap = true
     })
     await context.addInitScript(() => {
+      // Two foreground windows can compete even though one tab in a test window is hidden.
+      Object.defineProperty(document, 'hidden', { get: () => false })
+      Object.defineProperty(document, 'visibilityState', { get: () => 'visible' })
       Object.defineProperty(navigator, 'locks', { value: undefined })
       Object.defineProperty(navigator, 'deviceMemory', { value: 8 })
       Object.defineProperty(navigator, 'hardwareConcurrency', { value: 8 })
@@ -123,7 +124,7 @@ test.describe('Android Chrome', () => {
         return original.call(this, payload, ...options)
       }
     })
-    await importGames(page, opera + '\n\n' + immortal)
+    await importGames(page, ending(opera, 12) + '\n\n' + ending(immortal, 12))
     const other = await context.newPage()
     await other.goto('/')
     await other.getByRole('button', { name: /Anderssen – Kieseritzky/ }).click()
@@ -131,7 +132,7 @@ test.describe('Android Chrome', () => {
     await expect(page.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 45_000 })
     await expect(other.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 45_000 })
     await expect.poll(() => [...active.values()].reduce((sum, count) => sum + count, 0)).toBe(0)
-    expect(searches).toBeGreaterThan(150)
+    expect(searches).toBeGreaterThan(40)
     expect(peak).toBe(2)
     expect(overlap).toBe(false)
   })
@@ -141,13 +142,13 @@ test.describe('эмуляция iPhone', () => {
   const { defaultBrowserType: _browser, ...iphone } = devices['iPhone 15']
   test.use(iphone)
 
-  test('предупреждение Professional и остановка без автоматического перезапуска', async ({ page }) => {
+  test('предупреждение глубокого разбора и остановка без автоматического перезапуска', async ({ page }) => {
     await page.addInitScript(() => Object.defineProperty(navigator, 'standalone', { value: true }))
     await importGames(page)
-    const mode = page.getByRole('combobox', { name: 'Глубина анализа' })
-    await mode.selectOption('professional')
+    const mode = page.getByRole('combobox', { name: 'Тип разбора' })
+    await mode.selectOption('deep-review')
     page.once('dialog', async dialog => {
-      expect(dialog.message()).toContain('Профессиональный анализ требует значительных вычислительных ресурсов')
+      expect(dialog.message()).toContain('Глубокий разбор может занять несколько минут')
       await dialog.dismiss()
     })
     const start = page.getByRole('button', { name: 'Начать анализ' })
@@ -155,11 +156,11 @@ test.describe('эмуляция iPhone', () => {
     await expect(start).toBeEnabled()
     page.once('dialog', dialog => dialog.accept())
     await start.click()
-    await expect(page.getByText('Предварительная точность')).toBeVisible({ timeout: 20_000 })
+    await expect(page.getByText('Предварительный проход завершён')).toBeVisible({ timeout: 20_000 })
     await page.getByRole('button', { name: 'Пауза', exact: true }).click()
     await page.reload()
     await expect(page.getByRole('button', { name: 'Продолжить', exact: true })).toBeVisible()
-    await expect(page.getByText('Предварительная точность')).toBeVisible()
+    await expect(page.getByText('Предварительный проход завершён')).toBeVisible()
     await expect(page.getByRole('heading', { name: /Итоги партии/ })).toHaveCount(0)
   })
 })

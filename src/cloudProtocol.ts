@@ -1,15 +1,15 @@
-import { gameMoves, uci, type Game, type Mode } from './game.js'
+import { gameMoves, uci, type Game } from './game.js'
 
 export type ComputeSource = 'local' | 'cloud' | 'auto'
 export type ComputeEngine = Exclude<ComputeSource, 'auto'>
 export type Energy = 'eco' | 'balanced' | 'turbo'
-export type CloudMode = 'quick' | 'standard'
+export type CloudMode = 'smart' | 'quick' | 'standard'
 
 export { cloudEngine } from './game.js'
 export const cloudLimits = {
   jobCpuMs: 20_000, reservationCpuMs: 30_000, jobWallMs: 25_000, monthCpuMs: 3_600_000,
   jobsPerMonth: 120, concurrent: 1, requestBytes: 1024, pgnBytes: 48 * 1024,
-  plies: { quick: 100, standard: 40 },
+  plies: { smart: 60, quick: 100, standard: 40 },
 } as const
 
 export type CloudStatus = {
@@ -23,7 +23,7 @@ export type GameReference =
 
 export const cloudOptions = { threads: 1, hash: 16 } as const
 
-export const supportedCloudMode = (mode: Mode): mode is CloudMode => mode === 'quick' || mode === 'standard'
+export const supportedCloudMode = (mode: unknown): mode is CloudMode => mode === 'smart' || mode === 'quick' || mode === 'standard'
 
 export function referenceFor(game: Game): GameReference | undefined {
   if (!game.url || game.source === 'pgn') return
