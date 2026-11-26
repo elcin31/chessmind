@@ -43,7 +43,8 @@ export async function deviceConfiguration(options: EngineOptions): Promise<Confi
   const saving = lowBattery(await deviceBattery())
   const eco = options.energy === 'eco'
   const turbo = options.energy === 'turbo'
-  const canThread = device.sharedMemory && !device.constrained && !saving
+  // On Android, reserve the second search thread for an explicitly chosen Turbo profile.
+  const canThread = device.sharedMemory && !device.constrained && !saving && (!device.android || turbo)
   const hashLimit = eco || saving || device.mobile && (!turbo || (device.memory ?? 0) < 6) ? 16 :
     device.mobile ? 32 : (device.memory ?? 0) >= 8 ? 64 : 32
   return {
