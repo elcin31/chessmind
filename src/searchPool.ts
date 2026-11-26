@@ -27,12 +27,12 @@ export async function poolConfiguration(options: EngineOptions) {
   const device = deviceCapabilities()
   const eco = options.energy === 'eco'
   const turbo = options.energy === 'turbo'
-  const mobileLimit = device.constrained || config.saving ? 1 : 2
+  const mobileLimit = device.constrained || config.saving || (device.android && !turbo) ? 1 : 2
   const desktopLimit = device.constrained || config.saving ? 1 : turbo && device.cores >= 8 ? 4 : 2
   const safe = eco || options.full || options.threads === 1 ? 1 : device.mobile ? mobileLimit : desktopLimit
   const workers = Math.min(options.workers ?? safe, safe)
   const threads = workers === 1 && (!device.mobile || mobileLimit === 2) ? config.threads : 1
-  return { workers, threads, hash: config.hash as EngineOptions['hash'], mobile: device.mobile, battery: await deviceBattery() }
+  return { workers, threads, hash: config.hash as EngineOptions['hash'], mobile: device.mobile, android: device.android, battery: await deviceBattery() }
 }
 
 export class SearchPool {
@@ -51,7 +51,7 @@ export class SearchPool {
     private config: Awaited<ReturnType<typeof poolConfiguration>>, private publish: (status: PoolStatus) => void,
     private retryIndex?: number) {
     this.limit = config.workers
-    this.control = new LoadControl(options.energy ?? 'balanced', config.mobile, this.limit, config.battery)
+    this.control = new LoadControl(options.energy ?? 'balanced', config.mobile, this.limit, config.battery, config.android)
     this.control.start()
   }
 
