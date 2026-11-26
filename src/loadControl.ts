@@ -35,7 +35,7 @@ export class LoadControl {
   private since = 0
 
   constructor(private energy: Energy, private mobile: boolean, private workers: number,
-    private battery?: Awaited<ReturnType<typeof deviceBattery>>) {
+    private battery?: Awaited<ReturnType<typeof deviceBattery>>, private android = false) {
     const now = performance.now()
     while (previousRuns.length && now - previousRuns[0] > 90_000) previousRuns.shift()
     this.reduced = mobile && previousRuns.length >= 2
@@ -96,9 +96,9 @@ export class LoadControl {
     this.seriesSince ||= now
     const eco = this.energy === 'eco'
     const conserving = this.reduced || lowBattery(this.battery)
-    const threshold = eco ? 500 : conserving ? 850 : this.energy === 'turbo' ? 4000 : 1800
+    const threshold = eco ? 500 : conserving ? 850 : this.energy === 'turbo' ? 4000 : this.android ? 1000 : 1800
     if (this.budgetUsed < threshold && (this.budgetUsed < 120 || now - this.seriesSince < threshold * 3)) return 0
     this.budgetUsed = this.seriesSince = 0
-    return eco ? 400 : conserving ? 500 : this.energy === 'turbo' ? 80 : 180
+    return eco ? 400 : conserving ? 500 : this.energy === 'turbo' ? 80 : this.android ? 400 : 180
   }
 }
