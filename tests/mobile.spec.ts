@@ -44,42 +44,96 @@ test.describe('Android Chrome', () => {
     await expect(page.getByRole('button', { name: 'Анализ готов' })).toBeVisible()
   })
 
-  test('Android Balanced ограничивает суммарный параллелизм даже при 8 ГиБ памяти', async ({ page }) => {
-    let running = 0
-    let peak = 0
-    const commands: string[] = []
-    await page.exposeFunction('recordAndroidSearch', (message: string) => {
-      commands.push(message)
-      if (message.startsWith('go ')) peak = Math.max(peak, ++running)
-      if (message === 'bestmove') running--
-    })
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'deviceMemory', { value: 8 })
-      Object.defineProperty(navigator, 'hardwareConcurrency', { value: 8 })
-      localStorage.setItem('chessmind-mobile-local-warning', '1')
-      localStorage.setItem('chessmind-settings', JSON.stringify({ engine: { energy: 'balanced', workers: 4 }, computeSource: 'local' }))
-      const original = Worker.prototype.postMessage
-      const seen = new WeakSet()
-      const report = (message: string) => void (window as any).recordAndroidSearch(message)
-      Worker.prototype.postMessage = function (payload: unknown, ...options: []) {
-        if (typeof payload === 'string') {
-          if (!seen.has(this)) {
-            seen.add(this)
-            this.addEventListener('message', event => {
-              if (typeof event.data === 'string' && /^bestmove /m.test(event.data)) report('bestmove')
-            })
-          }
-          report(payload)
+  for (const [memory, width, height] of [[4, 360, 800], [6, 393, 873], [8, 412, 915]]) {
+    test(`Android Balanced · ${memory} ГиБ · ${width} × ${height}`, async ({ page }) => {
+      await page.setViewportSize({ width, height })
+      let running = 0
+      let peak = 0
+      const commands: string[] = []
+      await page.exposeFunction('recordAndroidSearch', (message: string) => {
+        commands.push(message)
+        if (message.startsWith('go ')) peak = Math.max(peak, ++running)
+        if (message === 'bestmove') running--
+      })
+      await page.addInitScript(memory => {
+        Object.defineProperty(navigator, 'deviceMemory', { value: memory })
+        Object.defineProperty(navigator, 'hardwareConcurrency', { value: 8 })
+        if (memory === 6) {
+          const original = window.matchMedia
+          window.matchMedia = query => query === '(display-mode: standalone)'
+            ? Object.assign(new EventTarget(), { matches: true, media: query }) as MediaQueryList
+            : original.call(window, query)
         }
-        return original.call(this, payload, ...options)
-      }
+        localStorage.setItem('chessmind-mobile-local-warning', '1')
+        localStorage.setItem('chessmind-settings', JSON.stringify({ engine: { energy: 'balanced', workers: 4 }, computeSource: 'local' }))
+        const original = Worker.prototype.postMessage
+        const seen = new WeakSet()
+        const report = (message: string) => void (window as any).recordAndroidSearch(message)
+        Worker.prototype.postMessage = function (payload: unknown, ...options: []) {
+          if (typeof payload === 'string') {
+            if (!seen.has(this)) {
+              seen.add(this)
+              this.addEventListener('message', event => {
+                if (typeof event.data === 'string' && /^bestmove /m.test(event.data)) report('bestmove')
+              })
+            }
+            report(payload)
+          }
+          return original.call(this, payload, ...options)
+        }
+      }, memory)
+      await importGames(page, ending(opera, 12))
+      const fits = () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
+      expect(await fits()).toBe(true)
+      await page.getByRole('button', { name: 'Начать анализ' }).click()
+      await expect(page.locator('.analysis-progress')).toBeVisible()
+      expect(await fits()).toBe(true)
+      await expect(page.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 60_000 })
+      expect(await fits()).toBe(true)
+      expect(await page.getByRole('button', { name: 'Вперёд' }).boundingBox()).toMatchObject({ width: 44, height: 44 })
+      expect(peak).toBe(1)
+      expect(commands).toContain('setoption name Hash value 16')
+      expect(commands.some(command => /setoption name Threads value 2/.test(command))).toBe(false)
     })
-    await importGames(page, ending(opera, 12))
+  }
+
+  test('сворачивание сохраняет черновик, а смена профиля не перезапускает готовый разбор', async ({ page, context }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(document, 'hidden', { value: false, configurable: true })
+      Object.defineProperty(navigator, 'deviceMemory', { value: 4 })
+      localStorage.setItem('chessmind-mobile-local-warning', '1')
+    })
+    let workers = 0
+    page.on('worker', () => workers++)
+    await importGames(page, ending(opera, 16))
+    const reviewUrl = page.url()
+    await expect(page.getByText('Офлайн готов')).toBeVisible()
     await page.getByRole('button', { name: 'Начать анализ' }).click()
-    await expect(page.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 60_000 })
-    expect(peak).toBe(1)
-    expect(commands).toContain('setoption name Hash value 16')
-    expect(commands.some(command => /setoption name Threads value 2/.test(command))).toBe(false)
+    await expect(page.getByText('Предварительный проход завершён')).toBeVisible()
+    const show = (hidden: boolean) => page.evaluate(hidden => {
+      Object.defineProperty(document, 'hidden', { value: hidden, configurable: true })
+      document.dispatchEvent(new Event('visibilitychange'))
+    }, hidden)
+    await show(true)
+    const previewCount = () => page.evaluate(() => new Promise<number>((resolve, reject) => {
+      const request = indexedDB.open('chessmind-review')
+      request.onsuccess = () => {
+        const entries = request.result.transaction('games').objectStore('games').getAll()
+        entries.onsuccess = () => { request.result.close(); resolve(entries.result[0]?.draft?.instant.filter(Boolean).length ?? 0) }
+        entries.onerror = () => reject(entries.error)
+      }
+      request.onerror = () => reject(request.error)
+    }))
+    await expect.poll(previewCount).toBe(17)
+    await context.setOffline(true)
+    await show(false)
+    await expect(page.getByRole('button', { name: 'Анализ готов' })).toBeVisible({ timeout: 60_000 })
+    const before = workers
+    await page.evaluate(() => { location.hash = 'settings' })
+    await page.getByRole('combobox', { name: 'Энергопотребление' }).selectOption('eco')
+    await page.goto(reviewUrl)
+    await expect(page.getByRole('button', { name: 'Анализ готов' })).toBeVisible()
+    expect(workers).toBe(before)
   })
 
   test('предел времени оставляет черновик и требует ручного продолжения', async ({ page }) => {
@@ -164,6 +218,7 @@ test.describe('Android Chrome', () => {
     })
     await importGames(page, ending(opera, 12) + '\n\n' + ending(immortal, 12))
     const other = await context.newPage()
+    for (const tab of [page, other]) tab.on('dialog', dialog => dialog.accept())
     await other.goto('/')
     await other.getByRole('button', { name: /Anderssen – Kieseritzky/ }).click()
     await Promise.all([page, other].map(tab => tab.getByRole('button', { name: 'Начать анализ' }).click()))

@@ -27,12 +27,13 @@ export async function poolConfiguration(options: EngineOptions) {
   const device = deviceCapabilities()
   const eco = options.energy === 'eco'
   const turbo = options.energy === 'turbo'
-  const mobileLimit = device.constrained || config.saving || (device.android && !turbo) ? 1 : 2
+  const mobileLimit = turbo && device.mobileParallel && !config.saving ? 2 : 1
   const desktopLimit = device.constrained || config.saving ? 1 : turbo && device.cores >= 8 ? 4 : 2
   const safe = eco || options.full || options.threads === 1 ? 1 : device.mobile ? mobileLimit : desktopLimit
   const workers = Math.min(options.workers ?? safe, safe)
-  const threads = workers === 1 && (!device.mobile || mobileLimit === 2) ? config.threads : 1
-  return { workers, threads, hash: config.hash as EngineOptions['hash'], mobile: device.mobile, android: device.android, battery: await deviceBattery() }
+  const threads = workers === 1 ? config.threads : 1
+  const hash = device.mobile && workers === 2 ? 16 : config.hash
+  return { workers, threads, hash: hash as EngineOptions['hash'], device, battery: await deviceBattery() }
 }
 
 export class SearchPool {
@@ -49,9 +50,9 @@ export class SearchPool {
 
   constructor(private signal: AbortSignal, private game: string, private options: EngineOptions,
     private config: Awaited<ReturnType<typeof poolConfiguration>>, private publish: (status: PoolStatus) => void,
-    private retryIndex?: number) {
+    private retryIndex?: number, deep = false) {
     this.limit = config.workers
-    this.control = new LoadControl(options.energy ?? 'balanced', config.mobile, this.limit, config.battery, config.android)
+    this.control = new LoadControl(options.energy ?? 'balanced', config.device, this.limit, config.battery, deep)
     this.control.start()
   }
 
@@ -79,7 +80,7 @@ export class SearchPool {
       this.lastPublish = now
       this.publish(this.status())
     }, this.game) }
-    if (this.config.mobile) slot.engine.shouldPauseForLoad = () => this.control.shouldPause
+    if (this.config.device.mobile) slot.engine.shouldPauseForLoad = () => this.control.shouldPause
     return slot
   }
 
@@ -114,7 +115,7 @@ export class SearchPool {
       return
     }
     if (this.cooling || !this.queue.length) return
-    if (this.control.capacity === 1 && this.config.threads === 2) {
+    if (this.control.parallelReduced && this.config.threads === 2) {
       if (this.running.size) return
       const [slot] = this.slots
       if (slot) {
@@ -144,8 +145,9 @@ export class SearchPool {
         }
       }
       const work = this.queue.splice(pickup, 1)[0]
-      let slot = this.slots.filter(item => !item.busy)
-        .sort((a, b) => Math.abs((a.previous ?? work.index) - work.index) - Math.abs((b.previous ?? work.index) - work.index))[0]
+      let slot = this.slots.reduce<Slot | undefined>((nearest, item) => item.busy ? nearest :
+        !nearest || Math.abs((item.previous ?? work.index) - work.index) < Math.abs((nearest.previous ?? work.index) - work.index)
+          ? item : nearest, undefined)
       if (!slot) {
         slot = this.newSlot()
         this.slots.push(slot)

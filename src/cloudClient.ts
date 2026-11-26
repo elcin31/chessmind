@@ -9,17 +9,20 @@ import type { PoolStatus } from './searchPool'
 const offline: CloudStatus = { available: false, reason: 'offline' }
 let currentStatus: Promise<CloudStatus> | undefined
 let checkedAt = 0
+let checking = false
 export function getCloudStatus(force = false): Promise<CloudStatus> {
   if (!navigator.onLine) return Promise.resolve(offline)
-  if (!force && currentStatus && Date.now() - checkedAt < 8000) return currentStatus
+  if (currentStatus && (checking || !force && Date.now() - checkedAt < 15_000)) return currentStatus
   checkedAt = Date.now()
+  checking = true
   currentStatus = fetch('/api/engine/status', { signal: AbortSignal.timeout(3500) })
     .then(async response => {
       if (!response.ok) throw new Error()
       const value: CloudStatus = await response.json()
       if (typeof value.available !== 'boolean') throw new Error()
       return value
-    }).catch(() => ({ available: false, reason: 'network' }))
+    }).catch((): CloudStatus => ({ available: false, reason: 'network' }))
+    .finally(() => { checking = false })
   return currentStatus
 }
 
@@ -28,16 +31,21 @@ export function useCloudStatus(visible: boolean, poll = true) {
   useEffect(() => {
     if (!visible) return
     let mounted = true
+    let timer: ReturnType<typeof setTimeout> | undefined
     const check = (event?: Event) => {
-      void getCloudStatus(poll || !!event).then(value => { if (mounted) setStatus(value) })
+      clearTimeout(timer)
+      if (document.hidden) return
+      void getCloudStatus(event?.type === 'online').then(value => { if (mounted) setStatus(value) })
+      if (poll && navigator.onLine) timer = setTimeout(check, 60_000)
     }
     check()
     window.addEventListener('online', check)
     window.addEventListener('offline', check)
-    const timer = poll ? setInterval(check, 30_000) : undefined
+    document.addEventListener('visibilitychange', check)
     return () => {
       mounted = false
-      clearInterval(timer)
+      clearTimeout(timer)
+      document.removeEventListener('visibilitychange', check)
       window.removeEventListener('online', check)
       window.removeEventListener('offline', check)
     }
@@ -74,7 +82,9 @@ export function chooseCompute(source: ComputeSource, game: Game, mode: Mode, sta
   return source !== 'local' && !cloudBlocker(game, mode, status) ? 'cloud' : 'local'
 }
 
-export class CloudUnavailable extends Error {}
+export class CloudUnavailable extends Error {
+  constructor(message: string, readonly rejectedBeforeStart = false) { super(message) }
+}
 
 let session: string | undefined
 function anonymousSession() {
@@ -143,7 +153,8 @@ export async function analyzeInCloud(game: Game, mode: Mode, signal: AbortSignal
   }
   if (!response.ok) {
     const error: { message?: string } = await response.json().catch(() => ({}))
-    throw new CloudUnavailable(error.message ?? 'Облачный анализ недоступен. Продолжите на устройстве.')
+    // The quota guard returns 429 before starting Stockfish.
+    throw new CloudUnavailable(error.message ?? 'Облачный анализ недоступен. Продолжите на устройстве.', response.status === 429)
   }
   if (!response.body || !response.headers.get('content-type')?.startsWith('application/x-ndjson')) {
     throw new CloudUnavailable('Облако вернуло неверный ответ.')

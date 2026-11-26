@@ -21,15 +21,23 @@ export const adaptiveBudgets = {
   'deep-review': { base: 'deep', critical: 'professional' },
 } as const satisfies Record<string, { base: LegacyMode; critical: LegacyMode }>
 
-export type Position = { initial: string; moves: string[]; fen: string; repetitions?: number; legal?: number }
+export type Position = {
+  initial: string; moves: string[]; fen: string; repetitions?: number; legal?: number;
+  facts?: { legal: number; turn: 1 | -1; inCheck: boolean; draw: ReturnType<typeof drawState> }
+}
+
+export function positionFacts(fen: string, repetitions?: number, knownLegal?: number): NonNullable<Position['facts']> {
+  const board = new Chess(fen)
+  const legal = knownLegal ?? board.perft(1)
+  return { legal, turn: board.turn() === 'w' ? 1 : -1, inCheck: board.isCheck(), draw: drawState(board, repetitions, legal) }
+}
+
 export function searchParameters(position: Position, mode: Mode, options: EngineOptions, critical: boolean,
   only?: string | readonly string[], targetDepth?: number, targetNodes?: number, maxLines?: number) {
-  const board = new Chess(position.fen)
-  const legal = position.legal ?? board.perft(1)
-  const turn = board.turn() === 'w' ? 1 : -1
-  if (!legal) return { terminal: [{ kind: board.isCheck() ? 'mate' : 'cp', value: board.isCheck() ? -turn : 0, pv: [], depth: 0,
-    wdl: board.isCheck() ? (turn === 1 ? [0, 0, 1000] : [1000, 0, 0]) : [0, 1000, 0] }] as Line[] }
-  if (drawState(board, position.repetitions, legal)?.automatic) return { terminal: [{ kind: 'cp', value: 0, pv: [], depth: 0, wdl: [0, 1000, 0] }] as Line[] }
+  const { legal, turn, inCheck, draw } = position.facts ?? positionFacts(position.fen, position.repetitions, position.legal)
+  if (!legal) return { terminal: [{ kind: inCheck ? 'mate' : 'cp', value: inCheck ? -turn : 0, pv: [], depth: 0,
+    wdl: inCheck ? (turn === 1 ? [0, 0, 1000] : [1000, 0, 0]) : [0, 1000, 0] }] as Line[] }
+  if (draw?.automatic) return { terminal: [{ kind: 'cp', value: 0, pv: [], depth: 0, wdl: [0, 1000, 0] }] as Line[] }
 
   const choices = typeof only === 'string' ? only : only?.join(' ')
   const budget = budgets[mode]

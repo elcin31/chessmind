@@ -10,11 +10,16 @@ const queueName = 'chessmind-queue'
 const leaseMs = 160_000
 let storage: ReturnType<typeof openDB<QueueDatabase>> | undefined
 
-async function updateLease(update: (state: QueueDatabase['state']['value']) => QueueDatabase['state']['value'] | undefined) {
+type QueueState = QueueDatabase['state']['value']
+function queueStorage() {
   storage ??= openDB<QueueDatabase>('chessmind-analysis-queue', 1, {
     upgrade(database) { database.createObjectStore('state') },
   })
-  const tx = (await storage).transaction('state', 'readwrite')
+  return storage
+}
+
+async function updateLease(update: (state: QueueState) => QueueState | undefined) {
+  const tx = (await queueStorage()).transaction('state', 'readwrite')
   const state = await tx.store.get(queueName) ?? {}
   const next = update(state)
   if (next) await tx.store.put(next, queueName)
@@ -51,8 +56,8 @@ export async function withAnalysisLock<T>(controller: AbortController, run: () =
 }
 
 export async function waitBetweenGames(signal: AbortSignal, eco: boolean) {
-  let finished = 0
-  await updateLease(state => { finished = state.finished ?? 0 }).catch(() => {})
+  const state = await queueStorage().then(database => database.get('state', queueName)).catch(() => undefined)
+  const finished = state?.finished ?? 0
   const delay = (eco ? 3500 : deviceCapabilities().mobile ? 2500 : 750) - (Date.now() - finished)
   if (delay > 0) await waitFor(delay, signal)
   signal.throwIfAborted()

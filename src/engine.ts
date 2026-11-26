@@ -22,11 +22,16 @@ const engineName = (config: Configuration) => (config.full ? 'Full' : 'Lite') + 
 const sameConfig = (a: Configuration, b: Configuration) => a.full === b.full && a.threads === b.threads && a.hash === b.hash
 
 let idle: { session: Session; expires: ReturnType<typeof setTimeout> } | undefined
-function park(session: Session) {
+export function releaseIdleEngine() {
   if (idle) {
     clearTimeout(idle.expires)
     idle.session.worker.terminate()
+    idle = undefined
   }
+}
+
+function park(session: Session) {
+  releaseIdleEngine()
   if (document.hidden) {
     idle = undefined
     session.worker.terminate()
@@ -43,9 +48,9 @@ export async function deviceConfiguration(options: EngineOptions): Promise<Confi
   const saving = lowBattery(await deviceBattery())
   const eco = options.energy === 'eco'
   const turbo = options.energy === 'turbo'
-  // On Android, reserve the second search thread for an explicitly chosen Turbo profile.
-  const canThread = device.sharedMemory && !device.constrained && !saving && (!device.android || turbo)
-  const hashLimit = eco || saving || device.mobile && (!turbo || (device.memory ?? 0) < 6) ? 16 :
+  // Mobile Turbo uses independent single-thread searches with a shared pool limit.
+  const canThread = device.sharedMemory && !device.mobile && !device.constrained && !saving && navigator.onLine !== false
+  const hashLimit = eco || saving || device.mobile && (!turbo || !device.mobileParallel) ? 16 :
     device.mobile ? 32 : (device.memory ?? 0) >= 8 ? 64 : 32
   return {
     full: options.full === true, saving,
@@ -63,7 +68,6 @@ export class Engine {
   private readonly recent = new Map<string, Line[]>()
   private readonly pending = new Map<string, CacheEntry>()
   private writing?: Promise<void>
-  private writes = 0
   private speed = 0
   extendTimeLimit = false
   shouldPauseForLoad?: () => boolean
@@ -80,7 +84,7 @@ export class Engine {
     const session = this.session
     this.session = undefined
     if (!session) return
-    if (reuse && this.initialized && !this.onCommand) park(session)
+    if (reuse && this.initialized && !this.onCommand && !(this.device.mobile && session.config.full)) park(session)
     else session.worker.terminate()
     this.initialized = false
   }
@@ -115,13 +119,15 @@ export class Engine {
           if (!this.signal.aborted) info?.(line)
         }
       }
-      const fail = () => {
+      const fail = (event?: Event) => {
+        event?.preventDefault()
         cleanup()
         this.close()
         reject(this.signal.aborted ? abortError() : new Error('Ошибка Stockfish WASM.'))
       }
       const abort = () => {
-        if (done !== 'bestmove') { fail(); return }
+        // A hidden page can be frozen before its watchdog or worker replies.
+        if (done !== 'bestmove' || document.hidden) { fail(); return }
         worker.postMessage('stop')
         clearTimeout(stopTimeout)
         stopTimeout = setTimeout(fail, 900)
@@ -170,11 +176,7 @@ export class Engine {
         this.session.game = this.game
       }
     } else {
-      if (idle) {
-        clearTimeout(idle.expires)
-        idle.session.worker.terminate()
-        idle = undefined
-      }
+      releaseIdleEngine()
       const name = '/engine/stockfish-19' + (config.full ? '' : '-lite') + (config.threads === 2 ? '' : '-single') + '.js'
       this.session = { worker: new Worker(name), config, game: this.game }
       await this.exchange(['uci'], 'uciok', config.full ? 90_000 : 25_000)
@@ -201,8 +203,10 @@ export class Engine {
       const recent = this.recent.get(key)
       if (recent) return recent
       if (!limit) return undefined
-      const record = this.pending.get(key) ?? await db.then(async storage => await storage.get('positions', key) ??
-        await storage.get('positions', key.replace('review:2:stockfish:19.0.1', '2.0.1:19.0.1'))).catch(() => undefined)
+      const record = this.pending.get(key) ?? await db.then(async storage => {
+        const store = storage.transaction('positions').store
+        return await store.get(key) ?? (!independent ? await store.get(key.replace('review:2:stockfish:19.0.1', '2.0.1:19.0.1')) : undefined)
+      }).catch(() => undefined)
       if (!record || Array.isArray(record)) return undefined
       if (Date.now() - record.used > 60_000) {
         this.pending.set(key, { ...record, used: Date.now(), hits: Math.min(32, (record.hits ?? 0) + 1) })
@@ -228,20 +232,22 @@ export class Engine {
 
     const session = this.session!
     const commands: string[] = []
+    // Stockfish 19 processes ucinewgame synchronously before the next command.
+    if (independent) commands.push('ucinewgame')
     if (session.count !== count) {
       commands.push('setoption name MultiPV value ' + count)
       session.count = count
     }
-    if (independent || session.position !== history) {
+    if (session.position !== history) {
       commands.push('position fen ' + history)
       session.position = history
     }
-    if (independent) await this.exchange(['ucinewgame', 'isready'], 'readyok', 10_000)
     commands.push('go depth ' + depth + ' nodes ' + nodes + (choices ? ' searchmoves ' + choices : ''))
     const output = collectLines(count, turn, engineName(config))
     // UCI depth and nodes bound the same search. A client wall limit is distinct
     // from the normal bestmove and can never populate the completed cache.
-    const mobileLimit = Math.max(8_000, Math.min(45_000, 4000 + 2000 * nodes / Math.max(50_000, this.speed)))
+    const ceiling = this.options.energy === 'eco' ? 18_000 : this.options.energy === 'turbo' ? 40_000 : 26_000
+    const mobileLimit = Math.max(8_000, Math.min(ceiling, 4000 + 2000 * nodes / Math.max(50_000, this.speed)))
     const softLimit = this.device.mobile ? mobileLimit * (this.extendTimeLimit ? 2 : 1) : undefined
     const started = performance.now()
     const interrupted = await this.exchange(commands, 'bestmove', softLimit ? softLimit + 1200 : 150_000, line => {
@@ -281,9 +287,11 @@ export class Engine {
       try {
         const transaction = (await db).transaction('positions', 'readwrite')
         await Promise.all([...entries.map(([key, value]) => transaction.store.put(value, key)), transaction.done])
-        const before = this.writes
-        this.writes += entries.length
-        if (before === 0 || Math.floor(before / 96) !== Math.floor(this.writes / 96)) await trimCache(this.options.cache ?? 3000)
+        writesSinceTrim += entries.length
+        if (writesSinceTrim >= 96) {
+          writesSinceTrim = 0
+          await trimCache(this.options.cache ?? 3000)
+        }
       } catch { /* The optional cache never blocks review. */ }
     })()
     await this.writing
@@ -291,6 +299,7 @@ export class Engine {
   }
 }
 
+let writesSinceTrim = 96
 export async function trimCache(limit: number) {
   const transaction = (await db).transaction('positions', 'readwrite')
   if (limit === 0) await transaction.store.clear()

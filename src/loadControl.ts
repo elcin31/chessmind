@@ -1,4 +1,4 @@
-import { lowBattery, type deviceBattery } from './device.js'
+import { lowBattery, type deviceBattery, type deviceCapabilities } from './device.js'
 import type { Energy } from './cloudProtocol.js'
 
 const previousRuns: number[] = []
@@ -22,8 +22,9 @@ export function waitFor(ms: number, signal: AbortSignal) {
 
 export class LoadControl {
   private budgetUsed = 0
+  private totalActive = 0
   private readonly baselines = new Map<string, { nps: number; samples: number }>()
-  private slow = 0
+  private slow = new Map<string, number>()
   private late = 0
   private faultCount = 0
   private reduced = false
@@ -33,22 +34,19 @@ export class LoadControl {
   private lastSampleAt = 0
   private seriesSince = 0
   private since = 0
+  private recordedRun = false
 
-  constructor(private energy: Energy, private mobile: boolean, private workers: number,
-    private battery?: Awaited<ReturnType<typeof deviceBattery>>, private android = false) {
-    const now = performance.now()
-    while (previousRuns.length && now - previousRuns[0] > 90_000) previousRuns.shift()
-    this.reduced = mobile && previousRuns.length >= 2
-    if (mobile) previousRuns.push(now)
-  }
+  constructor(private energy: Energy, private device: ReturnType<typeof deviceCapabilities>, private workers: number,
+    private battery?: Awaited<ReturnType<typeof deviceBattery>>, private deep = false) {}
 
-  get capacity() { return this.reduced || lowBattery(this.battery) ? 1 : this.workers }
+  get parallelReduced() { return this.reduced || lowBattery(this.battery) }
+  get capacity() { return this.parallelReduced ? 1 : this.workers }
   get shouldPause() {
     return this.pauseRequested || !!this.battery && !this.battery.charging && this.battery.level <= .05
   }
 
   start() {
-    if (!this.mobile || this.timer) return
+    if (!this.device.mobile || this.timer) return
     this.since = performance.now()
     let last = this.since
     this.timer = setInterval(() => {
@@ -69,8 +67,16 @@ export class LoadControl {
 
   record(activeMs: number, nps: number, searchType: string) {
     this.budgetUsed += activeMs
+    this.totalActive += activeMs
     const now = performance.now()
-    if (!this.mobile || activeMs < 180 || nps <= 0 || now - this.lastSampleAt < 200) return
+    if (!this.device.mobile) return
+    if (!this.recordedRun && this.totalActive >= 4000) {
+      while (previousRuns.length && now - previousRuns[0] > 90_000) previousRuns.shift()
+      if (previousRuns.length >= 2) this.reduced = true
+      previousRuns.push(now)
+      this.recordedRun = true
+    }
+    if (activeMs < 180 || nps <= 0 || now - this.lastSampleAt < 200) return
     this.lastSampleAt = now
     const baseline = this.baselines.get(searchType) ?? { nps: 0, samples: 0 }
     if (baseline.samples < 5) {
@@ -79,26 +85,33 @@ export class LoadControl {
       return
     }
     if (now - this.since < 12_000) return
-    this.slow = nps < baseline.nps * .58 ? this.slow + 1 : Math.max(0, this.slow - 1)
-    if (this.slow >= 4) this.reduced = true
-    if (this.slow >= 10 && (this.late >= 2 || now - this.since >= 90_000)) this.pauseRequested = true
+    const previous = this.slow.get(searchType) ?? 0
+    const slow = nps < baseline.nps * .58 ? previous + 1 : Math.max(0, previous - 1)
+    this.slow.set(searchType, slow)
+    if (slow >= 4) this.reduced = true
+    if (slow >= 10 && (this.late >= 2 || now - this.since >= 90_000)) this.pauseRequested = true
     if (this.reduced && nps >= baseline.nps * .84 && !this.late && !lowBattery(this.battery)) {
       if (++this.recoverySamples >= 8 && !this.faultCount) {
         this.reduced = false
-        this.recoverySamples = this.slow = 0
+        this.recoverySamples = 0
+        this.slow.clear()
       }
     } else this.recoverySamples = 0
   }
 
   cooldown() {
-    if (!this.mobile && this.energy !== 'eco' && !this.reduced) return 0
+    if (!this.device.mobile && this.energy !== 'eco' && !this.reduced) return 0
     const now = performance.now()
     this.seriesSince ||= now
-    const eco = this.energy === 'eco'
-    const conserving = this.reduced || lowBattery(this.battery)
-    const threshold = eco ? 500 : conserving ? 850 : this.energy === 'turbo' ? 4000 : this.android ? 1000 : 1800
+    const eco = this.energy === 'eco' || lowBattery(this.battery)
+    const turbo = this.energy === 'turbo' && !this.reduced
+    const threshold = eco ? 600 : this.reduced || this.device.constrained ? 850 :
+      turbo ? 2500 : this.device.android ? 1200 : 1500
     if (this.budgetUsed < threshold && (this.budgetUsed < 120 || now - this.seriesSince < threshold * 3)) return 0
+    const rest = eco ? 450 : this.reduced ? 500 : turbo ? 120 : 350
+    // Let a completed deep search cool down in proportion to an unusually long burst.
+    const extra = this.device.mobile && this.deep ? Math.min(1200, Math.max(0, this.budgetUsed - threshold) * .15) : 0
     this.budgetUsed = this.seriesSince = 0
-    return eco ? 400 : conserving ? 500 : this.energy === 'turbo' ? 80 : this.android ? 400 : 180
+    return rest + extra
   }
 }

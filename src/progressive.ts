@@ -1,4 +1,4 @@
-import { Chess, type Square } from 'chess.js'
+import { Chess, type Move, type Square } from 'chess.js'
 import { adaptiveMode, analysisKey, gameMoves, uci, type Game, type Mode } from './game.js'
 import { analyzeMove, expectation, winProbability, moveAccuracy, positionsFor, sacrifice, type Line, type Review } from './review.js'
 import type { PoolStatus } from './searchPool.js'
@@ -29,14 +29,20 @@ export function hasPreview(game: Game) {
   return validDraft(game)?.instant.every(Boolean) ?? false
 }
 
-export function inspectDraft(game: Game, draft: Draft, index: number, moves = gameMoves(game)): Review | undefined {
+const forcedMoves = new WeakMap<Move, boolean>()
+
+export function inspectDraft(game: Game, draft: Draft, index: number, moves = gameMoves(game), legal?: number): Review | undefined {
   const move = moves[index]
   const before = draft.instant[index], after = draft.instant[index + 1]
   // Display queued refinement only for the current analysis profile.
   const checked = draft.work?.profile === analysisKey(game) ? draft.work.reviews[index] : undefined
   if (checked) return checked
   if (!move || !before || !after) return
-  const forced = !before.pv.length || new Chess(move.before).perft(1) === 1
+  let forced = !before.pv.length || legal === 1
+  if (!forced && legal === undefined) {
+    forced = forcedMoves.get(move) ?? new Chess(move.before).perft(1) === 1
+    forcedMoves.set(move, forced)
+  }
   const matching = before.pv[0] === uci(move)
   const played: Line = matching ? before : { ...after, pv: [uci(move), ...after.pv] }
   const wdl = !!before.wdl && !!played.wdl
@@ -79,19 +85,18 @@ function criticalPositions(game: Game, draft: Draft, moves: ReturnType<typeof ga
 
 function adaptivePositions(game: Game, mode: 'smart' | 'deep-review', draft: Draft, moves: ReturnType<typeof gameMoves>, positions: ReturnType<typeof positionsFor>) {
   const ranked = moves.flatMap((move, index) => {
-    const { before, after, loss, cpLoss, forced } = inspectDraft(game, draft, index, moves)!
+    const { before, after, loss, cpLoss, forced } = inspectDraft(game, draft, index, moves, positions[index].legal)!
     if (forced) return []
     const second = draft.alternatives?.[index]
     const gap = second ? expectation(before, move.color, !!before.wdl && !!second.wdl) -
       expectation(second, move.color, !!before.wdl && !!second.wdl) : 0
     const winBefore = winProbability(before, move.color), winAfter = winProbability(after, move.color)
     const swing = winBefore === undefined || winAfter === undefined ? loss : Math.abs(winBefore - winAfter)
-    const board = new Chess(move.before)
     const mating = before.kind === 'mate' || after.kind === 'mate'
     const sacrificeCandidate = sacrifice(move, after)
     const uncertain = !before.stable || !after.stable || !second?.stable
     const different = before.pv[0] !== uci(move)
-    const rescue = gap >= 12 || board.isCheck() && (positions[index].legal ?? 0) <= 5
+    const rescue = gap >= 12 || positions[index].facts?.inCheck && (positions[index].legal ?? 0) <= 5
     const risk = Math.max(loss, swing * .6) + Math.min(12, (cpLoss ?? 0) / 12) +
       (uncertain ? 7 : 0) + (rescue ? 13 : 0) + (different ? 3 : 0) +
       (move.captured || move.promotion ? 4 : 0) + Math.min(6, (positions[index].legal ?? 0) / 8)
@@ -164,7 +169,8 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
   const previewOptions = { ...options, full: false }
   const makePool = createPool ?? (async (config: EngineOptions) => {
     const { SearchPool, poolConfiguration } = await import('./searchPool.js')
-    return new SearchPool(signal, game.id, config, await poolConfiguration(config), telemetry, retry?.reason === 'time' ? retry.index : undefined)
+    return new SearchPool(signal, game.id, config, await poolConfiguration(config), telemetry,
+      retry?.reason === 'time' ? retry.index : undefined, !previewOnly && mode === 'deep-review')
   })
   let pool = await makePool(previewOptions)
   let instant = draft.instant.filter(Boolean).length
@@ -207,7 +213,7 @@ export async function analyzeProgressively(game: Game, mode: Mode, signal: Abort
     const verify = async (index: number, stage: 'critical' | 'final') => {
       // The original comparison, mate and sacrifice checks remain in analyzeMove.
       // Priority also rechecks a preview with serious, contradictory evidence.
-      const preview = inspectDraft(game, draft, index, moves)
+      const preview = inspectDraft(game, draft, index, moves, positions[index].legal)
       const prioritize = stage === 'critical' && !!preview && (mode === 'lite' || preview.loss >= 23 || preview.before.kind !== preview.after.kind)
       const strong = stage === 'critical' && adaptive
       const searchMode = adaptive ? adaptiveBudgets[mode][strong ? 'critical' : 'base'] : mode

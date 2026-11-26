@@ -15,7 +15,7 @@ import { Chart } from './Charts'
 import { coachingPrinciple } from './coach'
 import { annotatedPgn, readClocks } from './pgn'
 import { budgets } from './engine'
-import { adaptiveMode, analysisKey, methodologyVersion, reviewMode, reviewModes, gameMoves, isComplete, playerColor, timeLabel, type EngineOptions, type Game, type Mode } from './library'
+import { adaptiveMode, analysisKey, compatibleAnalysisKeys, methodologyVersion, reviewMode, reviewModes, gameMoves, isComplete, playerColor, timeLabel, type EngineOptions, type Game, type Mode } from './library'
 import { categories, errors, estimatedRating, evalLabel, expectation, phases, material, recheckMove, summarize, variation, type Review, type Category, type Phase } from './review'
 
 export const percent = (value?: number) => value === undefined ? '—' : value.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%'
@@ -31,8 +31,9 @@ export function Empty({ title, message, children }: { title: string; message?: s
 type Props = {
   game?: Game; initialPly?: number; games: Game[]; nickname: string; mode: Mode; active?: string; options?: EngineOptions;
   preferredSource: ComputeSource; onQueue: (game: Game, mode: Mode, source: ComputeSource, eco?: boolean) => void; onPause: (game: Game) => void; onImport: () => void;
+  batteryLow?: boolean;
 }
-export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode, active, options, preferredSource, onQueue, onPause, onImport }: Props) {
+export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode, active, options, preferredSource, onQueue, onPause, onImport, batteryLow }: Props) {
   const [snapshot, setSnapshot] = useState('')
   const saved = base?.savedAnalyses?.find(item => analysisKey(item) === snapshot)
   const game = saved && base ? { ...base, ...saved } : base
@@ -45,15 +46,19 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   const [speed, setSpeed] = useState<Mode>(reviewMode(game?.mode ?? mode))
   const [computeSource, setComputeSource] = useState<ComputeSource>(base?.queueSource ?? preferredSource)
   const requestsCloud = !!base && supportedCloudMode(speed) && !!referenceFor(base) &&
-    (computeSource !== 'local' || base.compute === 'cloud')
-  const cloud = useCloudStatus(requestsCloud)
+    computeSource !== 'local' && (computeSource === 'cloud' && base.compute !== 'cloud' || !isComplete(base) || reviewMode(base.mode) !== speed)
+  const cloud = useCloudStatus(requestsCloud, !active)
   const [compact, setCompact] = useState(false)
   const [graph, setGraph] = useState<'points' | 'cp'>('points')
   const [checked, setChecked] = useState<Record<number, Review>>({})
   const [checking, setChecking] = useState<number>()
   const [checkError, setCheckError] = useState('')
   const controller = useRef<AbortController>(undefined)
-  useEffect(() => () => controller.current?.abort(), [])
+  useEffect(() => {
+    const hide = () => { if (document.hidden) { controller.current?.abort(); autoplay(false) } }
+    document.addEventListener('visibilitychange', hide)
+    return () => { document.removeEventListener('visibilitychange', hide); controller.current?.abort() }
+  }, [])
   const clocks = useMemo(() => game && /%clk|%emt/.test(game.pgn) ? readClocks(game.pgn, moves, game.time) : [], [game?.pgn, moves, game?.time])
   const live = useLiveReview(base?.id)
   const draft = !saved && base ? live ?? validDraft(base.compute === 'cloud' ? { ...base, draft: base.cloudDraft } : base) : undefined
@@ -79,8 +84,25 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
     setBranches([])
     setIndex(previous => Math.max(0, Math.min(moves.length, previous + direction)))
   }, [moves.length])
-  const navigable = (i: number) => Math.max(0, Math.min(moves.length, i))
-  function navigate(i: number) { setBranches([]); setIndex(navigable(i)) }
+  const navigate = useCallback((i: number) => {
+    setBranches([])
+    setIndex(Math.max(0, Math.min(moves.length, i)))
+  }, [moves.length])
+  const chart = useMemo(() => Array.from({ length: moves.length + 1 }, (_, ply) => {
+    const line = (ply ? byIndex[ply - 1]?.after : byIndex[0]?.before) ?? draft?.instant[ply]
+    return line ? [{ line, ply }] : []
+  }).flat(), [byIndex, moves.length, draft?.instant])
+  const values = useMemo(() => chart.map(({ line }) => graph === 'points' ? expectation(line) :
+    line.kind === 'mate' ? Math.sign(line.value) * 12 : Math.max(-12, Math.min(12, line.value / 100))), [chart, graph])
+  const chartLabels = useMemo(() => chart.map(({ ply, line }) => (ply ? moves[ply - 1].san : 'Старт') + ' · ' + evalLabel(line)), [chart, moves])
+  const selectPoint = useCallback((point: number) => navigate(chart[point].ply), [chart, navigate])
+  const selectedPoint = chart.findIndex(item => item.ply === index)
+  const summary = useMemo(() => finished ? { white: summarize(reviews, 'w'), black: summarize(reviews, 'b') } : undefined, [finished, reviews])
+  const variants = useMemo(() => {
+    if (!review || !last) return []
+    const lines = review.preliminary || review.lines.some(line => line.pv[0] === review.played.pv[0]) ? review.lines : [...review.lines, review.played]
+    return lines.filter(line => line.pv.length > 0).map(line => ({ line, steps: variation(last.before, line.pv) }))
+  }, [review, last])
   useEffect(() => {
     if (!playing || index >= moves.length) return
     const timer = setTimeout(() => { setBranches([]); setIndex(index + 1); if (index + 1 === moves.length) autoplay(false) }, 900)
@@ -114,30 +136,29 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
   if (!bestMoves.length) bestMoves.push(...reviews.filter(item => item.category === 'best' && !item.forced).slice(0, 3))
   const nextError = landmarks.find(item => item.index + 1 > index && errors.includes(item.category))
   const nextGuided = landmarks.find(item => item.index + 1 > index)
-  const white = summarize(reviews, 'w'), black = summarize(reviews, 'b')
+  const { white, black } = summary ?? {}
   const ready = reviews.at(-1)
   const instantCount = draft?.instant.filter(Boolean).length ?? 0
-  const chart = Array.from({ length: moves.length + 1 }, (_, ply) => {
-    const line = (ply ? byIndex[ply - 1]?.after : byIndex[0]?.before) ?? draft?.instant[ply]
-    return line ? [{ line, ply }] : []
-  }).flat()
   const clock = clocks[index - 1]
   const pressureErrors = rankedErrors.filter(item => {
     const remaining = clocks[item.index]?.remaining
     return remaining !== undefined && remaining <= 30
   })
   const compute = computeSource === 'auto' ? (game.compute ?? 'local') : computeSource
-  const sameProfile = !!base && analysisKey(base) === analysisKey({ methodology: methodologyVersion, mode: speed, compute, options: compute === 'cloud' ? cloudOptions : options })
+  const sameProfile = !!base && compatibleAnalysisKeys(analysisKey(base), analysisKey({
+    methodology: methodologyVersion, mode: speed, compute, options: compute === 'cloud' ? cloudOptions : options,
+  }))
   const changedEnergy = (game.options?.energy ?? 'balanced') !== (options?.energy ?? 'balanced')
   const hasCloudResult = [game, ...game.savedAnalyses ?? []].some(item =>
     item.reviews?.length === game.moves && analysisKey(item) ===
       analysisKey({ methodology: methodologyVersion, mode: speed, compute: 'cloud', options: cloudOptions }))
   const blocker = computeSource !== 'local' && !hasCloudResult ? cloudBlocker(game, speed, cloud) : undefined
-  const offerLocal = !saved && !game.queued && (computeSource === 'cloud' && !!blocker ||
+  const offerLocal = !saved && !game.queued && active !== game.id && (computeSource === 'cloud' && !!blocker ||
     !completed && base?.compute === 'cloud' && active !== game.id)
   const switchLocal = () => { setComputeSource('local'); onQueue(game, speed, 'local') }
   async function verify() {
-    if (!game || !review) return
+    if (!game || !review || computeSource === 'cloud' || document.hidden) return
+    if (options?.full && !window.confirm('Stockfish Full использует больше памяти и вычислительных ресурсов.')) return
     const current = new AbortController()
     controller.current = current
     const moveIndex = index - 1
@@ -200,15 +221,21 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
       {!saved && computeSource !== 'local' && <div className="preview-summary" role="status">
         <span>{hasCloudResult ? 'Облачный результат сохранён на устройстве.' : blocker ?? cloudState(cloud)}</span>
       </div>}
-      {!saved && !game.queued && game.loadPaused &&
-        <button onClick={() => { setComputeSource('local'); onQueue(game, speed, 'local', true) }}>Продолжить в Eco</button>}
+      {!saved && !game.queued && !completed && !active && computeSource !== 'cloud' && (game.loadPaused || batteryLow && options?.energy !== 'eco') &&
+        <div className="preview-summary">
+          {batteryLow && <span>Низкий заряд аккумулятора</span>}
+          <button onClick={() => { setComputeSource('local'); onQueue(game, speed, 'local', true) }}>
+            {game.loadPaused || instantCount ? 'Продолжить в Eco' : 'Начать в Eco'}
+          </button>
+        </div>}
       {draft?.interrupted && !completed && <p className="muted">Поиск прерван на позиции {draft.interrupted.index + 1}.
         {draft.interrupted.line && ' Сохранена предварительная оценка с глубины ' + draft.interrupted.line.depth + '.'}</p>}
       {game.mode && !adaptiveMode(game.mode) && (game.reviews?.length || draft) && <p className="muted">
         Сохранённый режим {budgets[game.mode].label}{game.mode === 'lite' ? ' · облегчённый анализ с одним вариантом' : ''}.
       </p>}
       {offerLocal && <button onClick={switchLocal}>Продолжить на устройстве</button>}
-      {!saved && !completed && (game.queued || active === game.id || draft?.interrupted || reviews.some(item => !item.preliminary) || !!instantCount && instantCount < moves.length + 1) && <>
+      {!saved && !completed && (game.queued || active === game.id || draft?.interrupted || reviews.some(item => !item.preliminary) ||
+        !!instantCount && (instantCount < moves.length + 1 || !!game.mode)) && <>
         <AnalysisProgress id={game.id} initial={instantCount} checked={reviews.filter(item => !item.preliminary).length} total={moves.length}
           running={active === game.id} queued={!!game.queued} />
       </>}
@@ -221,14 +248,14 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
       {completed && saved && <p className="muted">Открыт ранее сохранённый разбор.</p>}
       {completed && !saved && game.compute === 'cloud' && game.cloudCacheHit && <p className="muted">Найден готовый анализ в кэше.</p>}
     </section>
-    <div className="review-layout">
+    <div className="review-layout" data-analyzing={active === game.id || undefined}>
       <section className="board-column">
         <div className="player-line">{player(orientation === 'b' ? 'w' : 'b')}</div>
         <div className="evaluation-layout">
           <div className="eval-bar" aria-label="Преимущество"><div style={{ height: expectation(review?.after ?? draft?.instant[index] ?? byIndex[0]?.before ?? { kind: 'cp', value: 0, depth: 0, pv: [] }, orientation) + '%' }} /><span>{evalLabel(review?.after ?? draft?.instant[index] ?? byIndex[0]?.before)}</span></div>
           <Board fen={position} orientation={orientation} last={branches.at(-1) ?? last}
             accent={review && errors.includes(review.category) && !branches.length ? categories[review.category][2] : undefined}
-            arrows={arrows} onMove={tryMove} onSwipe={swipe} />
+            arrows={arrows} onMove={tryMove} onSwipe={swipe} animate={active !== game.id} />
         </div>
         <div className="player-line">{player(orientation)}</div>
         <div className="board-controls">{controls}</div>
@@ -244,11 +271,9 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
           <select aria-label="Величина на графике" value={graph} onChange={event => setGraph(event.target.value as 'points' | 'cp')}>
             <option value="points">Ожидаемые очки</option><option value="cp">Оценка в пешках</option>
           </select></div>
-          <Chart center={graph === 'points' ? 50 : undefined} values={chart.map(({ line }) =>
-            graph === 'points' ? expectation(line) : line.kind === 'mate' ? Math.sign(line.value) * 12 : Math.max(-12, Math.min(12, line.value / 100)))}
-            labels={chart.map(({ ply, line }) => (ply ? moves[ply - 1].san : 'Старт') + ' · ' + evalLabel(line))}
-            selected={chart.some(item => item.ply === index) ? chart.findIndex(item => item.ply === index) : undefined}
-            onSelect={point => navigate(chart[point].ply)} caption={graph === 'points' ? 'Ожидаемый результат белых' : 'Оценка белых · шкала ±12, мат на границе'} /></section>}
+          <Chart center={graph === 'points' ? 50 : undefined} values={values} labels={chartLabels}
+            selected={selectedPoint === -1 ? undefined : selectedPoint} onSelect={selectPoint}
+            caption={graph === 'points' ? 'Ожидаемый результат белых' : 'Оценка белых · шкала ±12, мат на границе'} /></section>}
 
       </section>
       <div className="review-details">
@@ -282,15 +307,14 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
               <div><small>Потеря ожидания</small><b>{number(review.loss)} п. п.</b></div>
               <div><small>Ожидание игрока</small><b>{percent(expectation(review.before, review.color, !!review.before.wdl && !!review.played.wdl))} → {percent(expectation(review.played, review.color, !!review.before.wdl && !!review.played.wdl))}</b></div></div>
             <div className="action-row">{checking !== undefined ? <button onClick={() => controller.current?.abort()}>Остановить перепроверку</button> :
-              <button disabled={!!active || !!saved} onClick={() => void verify()}>{game.compute === 'cloud' ? 'Перепроверить на устройстве' : 'Перепроверить ход'}</button>}</div>
+              <button disabled={!!active || !!saved || computeSource === 'cloud'} onClick={() => void verify()}>{game.compute === 'cloud' ? 'Перепроверить на устройстве' : 'Перепроверить ход'}</button>}</div>
             {checkError && <p role="alert">{checkError}</p>}
             {checking !== undefined && <p role="status">Stockfish перепроверяет ход…</p>}
           </> : <p className="muted">{index ? 'Этот ход ещё не проанализирован.' : 'Выберите ход партии для просмотра объяснения.'}</p>}
           {reviews.length > 0 && <div className="action-row"><button disabled={!nextError} onClick={() => nextError && navigate(nextError.index + 1)}><Flag size={16} /> К ошибке</button>
             <button disabled={!nextGuided && guided} onClick={() => { guide(true); const next = guided ? nextGuided : landmarks[0] ?? reviews[0]; if (next) navigate(next.index + 1) }}>
               {guided ? 'Следующий момент' : 'Пошаговый разбор'}</button></div>}
-          {review && <div className="variations"><h4>{review.preliminary ? 'Предварительное продолжение' : 'Сравнение вариантов'}</h4>{(review.preliminary || review.lines.some(line => line.pv[0] === review.played.pv[0]) ? review.lines : [...review.lines, review.played]).filter(line => line.pv.length > 0).map((line, idx) => {
-            const steps = variation(last!.before, line.pv)
+          {review && <div className="variations"><h4>{review.preliminary ? 'Предварительное продолжение' : 'Сравнение вариантов'}</h4>{variants.map(({ line, steps }, idx) => {
             return <div className="pv" key={line.pv[0]}><button onClick={() => branch(last!.before, line.pv)}><strong>{evalLabel(line)}</strong><span>{steps.slice(0, 8).map(step => step.san).join(' ')}</span>{(idx === 0 || line.pv[0] === review.played.pv[0]) && <small>{idx === 0 ? 'Лучший' : 'Сыгранный'}{idx === 0 && line.pv[0] === review.played.pv[0] ? ' · сыгранный' : ''}</small>}</button>
               {branches[0]?.before === last!.before && branches[0]?.lan === steps[0]?.lan && <div className="pv-steps">{steps.map((step, i) => <button key={i} onClick={() => setBranches(steps.slice(0, i + 1))}>{step.san}</button>)}</div>}</div>
           })}</div>}
@@ -302,7 +326,7 @@ export function ReviewScreen({ game: base, initialPly = 0, games, nickname, mode
               byIndex[i] && <Marker category={byIndex[i]!.category} />}</button>)}</div></section>
       </div>
     </div>
-    {completed && <div className="review-summary">
+    {white && black && <div className="review-summary">
       <section className="panel"><h3>Итоги партии <small>· Методология {game.methodology ?? 1}.0</small></h3>
         <table><thead><tr><th>Показатель</th><th>Белые</th><th>Чёрные</th></tr></thead><tbody>
           <tr><td>Точность</td><td>{percent(white.accuracy)}</td><td>{percent(black.accuracy)}</td></tr>

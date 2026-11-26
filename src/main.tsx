@@ -3,7 +3,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { DEFAULT_POSITION } from 'chess.js'
 import { Activity, ArrowDownToLine, ArrowRight, BookOpen, ChartNoAxesCombined, CircleHelp, Cpu, FolderOpen, House, List, MonitorDown, Settings2, ShieldCheck, Target, Upload, Zap } from 'lucide-react'
 import { analyzeInCloud, chooseCompute, CloudUnavailable, cloudBlocker, cloudState, getCloudStatus, useCloudStatus } from './cloudClient'
-import { deviceCapabilities } from './device'
+import { deviceBattery, deviceCapabilities, lowBattery } from './device'
 import { markGameFinished, waitBetweenGames, withAnalysisLock } from './analysisQueue'
 import { AnalysisLoadPause } from './loadControl'
 import { ComputeSelect } from './ComputeSettings'
@@ -13,8 +13,8 @@ import { GameCard } from './PlayerCard'
 import { Board } from './Board'
 import { ImportForm } from './Import'
 import { Empty, ReviewScreen } from './ReviewScreen'
-import { budgets, SearchInterrupted, trimCache } from './engine'
-import { adaptiveMode, analysisKey, db, methodologyVersion, reviewMode, reviewModes, historicalRating, isComplete, parsePgn, playerColor, timeLabel, type Analysis, type EngineOptions, type Game, type Mode, type Practice } from './library'
+import { budgets, releaseIdleEngine, SearchInterrupted, trimCache } from './engine'
+import { adaptiveMode, analysisKey, compatibleAnalysisKeys, db, methodologyVersion, reviewMode, reviewModes, historicalRating, isComplete, parsePgn, playerColor, timeLabel, type Analysis, type EngineOptions, type Game, type Mode, type Practice } from './library'
 import { categories, type Line, type Review } from './review'
 import { analyzeProgressively, hasPreview, type Draft, type StageProgress } from './progressive'
 import type { PoolStatus } from './searchPool'
@@ -28,8 +28,11 @@ const Endgames = lazy(() => import('./Endgames').then(module => ({ default: modu
 
 const mobileWarning = 'Анализ выполняется на вашем устройстве и может увеличивать расход заряда аккумулятора и нагрев телефона'
 const deepWarning = 'Глубокий разбор может занять несколько минут'
+const turboWarning = 'Turbo может ускорить разряд аккумулятора и повысить нагрев'
+const fullWarning = 'Stockfish Full использует больше памяти и вычислительных ресурсов'
 const queueEventKey = 'chessmind-queue-event'
 type QueueEvent = { id: string; manual?: boolean }
+type AnalysisTask = { id: string; controller: AbortController; automatic: boolean; revision?: number; checkpoint?: () => Promise<void> }
 
 const pages = {
   home: { label: 'Главная', icon: House, title: 'Рабочий стол', subtitle: '' },
@@ -91,9 +94,11 @@ function App() {
   const [offline, setOffline] = useState(false)
   const [update, setUpdate] = useState<ServiceWorker>()
   const [visible, setVisible] = useState(!document.hidden)
+  const [batteryLow, setBatteryLow] = useState(false)
+  const [batteryReady, setBatteryReady] = useState(false)
   const channel = useRef<BroadcastChannel | undefined>(undefined)
   const submitting = useRef(false)
-  const current = useRef<{ id: string; controller: AbortController; automatic: boolean; revision?: number } | undefined>(undefined)
+  const current = useRef<AnalysisTask | undefined>(undefined)
   const state = pages[location.page]
   const sorted = useMemo(() => [...games].sort((first, second) => second.date.localeCompare(first.date) || (second.timestamp ?? 0) - (first.timestamp ?? 0)), [games])
   const selected = games.find(game => game.id === location.id) ?? sorted[0]
@@ -105,8 +110,14 @@ function App() {
 
   useEffect(() => {
     function onRoute() { setLocation(route()); window.scrollTo(0, 0) }
+    function pageHide() {
+      const task = current.current
+      void task?.checkpoint?.().catch(() => {})
+      task?.controller.abort()
+      releaseIdleEngine()
+    }
     function visibility() {
-      if (document.hidden) current.current?.controller.abort()
+      if (document.hidden) pageHide()
       setVisible(!document.hidden)
     }
     const refresh = (signal?: QueueEvent) => {
@@ -114,12 +125,12 @@ function App() {
       const task = current.current
       if (signal.manual && task?.automatic) task.controller.abort()
       void db.then(async storage => {
-        const all = await storage.getAll('games')
-        const latest = all.find(game => game.id === signal.id)
+        const latest = await storage.get('games', signal.id)
         if (task && !task.automatic && task.id === signal.id && (!latest?.queued || latest.queuedAt !== task.revision)) {
           task.controller.abort()
         }
-        setGames(all)
+        if (latest) setGames(previous => previous.some(game => game.id === latest.id) ?
+          previous.map(game => game.id === latest.id ? latest : game) : [...previous, latest])
       }).catch(() => {})
     }
     const queueChannel = typeof BroadcastChannel === 'undefined' ? undefined : new BroadcastChannel('chessmind-queue')
@@ -128,8 +139,8 @@ function App() {
         try { refresh(JSON.parse(event.newValue)) } catch { /* Ignore malformed storage events. */ }
       }
     }
-    const pageHide = () => current.current?.controller.abort()
     window.addEventListener('pagehide', pageHide)
+    document.addEventListener('freeze', pageHide)
     window.addEventListener('storage', onStorage)
     channel.current = queueChannel
     if (queueChannel) queueChannel.onmessage = event => refresh(event.data)
@@ -142,10 +153,29 @@ function App() {
     return () => {
       queueChannel?.close()
       window.removeEventListener('pagehide', pageHide)
+      document.removeEventListener('freeze', pageHide)
       window.removeEventListener('storage', onStorage)
       window.removeEventListener('hashchange', onRoute)
       document.removeEventListener('visibilitychange', visibility)
     }
+  }, [])
+  useEffect(() => {
+    if (!deviceCapabilities().mobile) { setBatteryReady(true); return }
+    let dispose: (() => void) | undefined
+    let live = true
+    void deviceBattery().then(battery => {
+      if (!live) return
+      const update = () => setBatteryLow(lowBattery(battery))
+      update()
+      setBatteryReady(true)
+      battery?.addEventListener('levelchange', update)
+      battery?.addEventListener('chargingchange', update)
+      dispose = () => {
+        battery?.removeEventListener('levelchange', update)
+        battery?.removeEventListener('chargingchange', update)
+      }
+    })
+    return () => { live = false; dispose?.() }
   }, [])
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme
@@ -179,16 +209,18 @@ function App() {
   }
   useEffect(() => {
     const warned = !deviceCapabilities().mobile || localStorage.getItem('chessmind-mobile-local-warning')
-    const autoPreview = settings.engine?.energy === 'eco' || settings.computeSource === 'cloud' || !warned ? 0 : settings.autoPreview || 0
+    const autoPreview = !batteryReady || batteryLow || settings.engine?.energy === 'eco' || settings.computeSource === 'cloud' || !warned
+      ? 0 : settings.autoPreview || 0
     if (!autoPreview && current.current?.automatic) current.current.controller.abort()
     if (!visible || current.current || active) return
     const manual = games.filter(game => game.queued).sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0))[0]
     const pending = manual ?? sorted.slice(0, autoPreview)
-      .find(game => game.queueSource !== 'cloud' && !isComplete(game) && !game.autoPreviewPaused && !hasPreview(game))
+      .find(game => game.compute !== 'cloud' && game.queueSource !== 'cloud' && !isComplete(game) && !game.autoPreviewPaused && !hasPreview(game))
     if (!pending) return
     const automatic = !manual
     const controller = new AbortController()
-    current.current = { id: pending.id, controller, automatic, revision: pending.queuedAt }
+    const task: AnalysisTask = { id: pending.id, controller, automatic, revision: pending.queuedAt }
+    current.current = task
     setActive(pending.id)
     const run = async () => {
       if (localStorage.getItem(stopKey(pending)) === stopRevision(pending)) {
@@ -198,15 +230,18 @@ function App() {
       }
       await waitBetweenGames(controller.signal, (automatic ? settings.engine : pending.options)?.energy === 'eco')
       const storage = await db
-      if (automatic && (await storage.getAll('games')).some(game => game.queued)) {
-        setGames(await storage.getAll('games'))
-        return
+      if (automatic) {
+        const all = await storage.getAll('games')
+        if (all.some(game => game.queued)) { setGames(all); return }
       }
       let latest = await storage.get('games', pending.id)
       if (!latest || controller.signal.aborted || !automatic && (!latest.queued || latest.queuedAt !== pending.queuedAt) ||
-        automatic && (latest.queued || latest.queueSource === 'cloud' || latest.autoPreviewPaused || hasPreview(latest) || isComplete(latest))) return mergeGame(latest)
+        automatic && (latest.queued || latest.compute === 'cloud' || latest.queueSource === 'cloud' || latest.autoPreviewPaused ||
+          hasPreview(latest) || isComplete(latest))) return mergeGame(latest)
       if (!automatic && !latest.methodology) {
-        latest = await patchGame(latest.id, prepareAnalysis(latest, latest.mode ?? 'smart', settings.engine))
+        const cloud = latest.queueSource === 'cloud' || latest.compute === 'cloud'
+        latest = await patchGame(latest.id, prepareAnalysis(latest, latest.mode ?? 'smart',
+          cloud ? cloudOptions : settings.engine, cloud ? 'cloud' : 'local'))
       }
       if (!latest) return
       if (localStorage.getItem(stopKey(latest)) === stopRevision(latest)) {
@@ -215,7 +250,7 @@ function App() {
         return
       }
       const { id, queuedAt } = latest
-      const compute = !automatic && latest.compute === 'cloud' ? 'cloud' : 'local'
+      const compute = !automatic && (latest.compute === 'cloud' || latest.queueSource === 'cloud') ? 'cloud' : 'local'
       const mode = latest.mode ?? settings.mode
       if (compute === 'local' && deviceCapabilities().mobile && !warned) {
         setStatus(mobileWarning + '.')
@@ -235,7 +270,7 @@ function App() {
       const publish = (transition = false) => {
         if (!status) return
         const now = performance.now()
-        if (!transition && now - lastPublish < 150) return
+        if (!transition && now - lastPublish < 250) return
         lastPublish = now
         const step = status.stage === 'instant' ? status.instant : status.stage === 'critical' ? status.criticalDone : status.checked
         const total = status.stage === 'instant' ? status.moves + 1 : status.stage === 'critical' ? status.critical : status.moves
@@ -245,13 +280,14 @@ function App() {
       }
       const persist = (final?: { draft: Draft; reviews?: Review[]; cached?: boolean }) => {
         if (!staged || !status) return saving
-        const stamp = [status.stage, status.instant, status.checked, staged.interrupted?.index, staged.interrupted?.line?.depth].join(':')
+        const stamp = [status.stage, status.instant, status.checked, staged.interrupted?.index,
+          staged.interrupted?.reason, staged.interrupted?.line?.depth].join(':')
         if (!final && stamp === persisted) return saving
         persisted = stamp
         lastSave = performance.now()
         const checkpoint = copy(staged)
         const draft = final ? copy(final.draft) : checkpoint
-        saving = saving.then(async () => {
+        saving = saving.catch(() => {}).then(async () => {
           const tx = (await db).transaction('games', 'readwrite')
           const record = await tx.store.get(id)
           if (record) {
@@ -261,17 +297,24 @@ function App() {
             // An old task may contribute Instant positions after a mode switch.
             const completedDraft = final?.reviews && !finished ? checkpoint : draft
             const field = compute === 'cloud' ? 'cloudDraft' : 'draft'
+            const currentProfile = analysisKey(record)
+            const compatibleWork = completedDraft.work && compatibleAnalysisKeys(completedDraft.work.profile, currentProfile)
+              ? { ...completedDraft.work, profile: currentProfile } : undefined
             const nextDraft = unchanged ? completedDraft :
-              mergeDraft(record[field], { ...completedDraft, work: undefined, interrupted: undefined })
+              mergeDraft(record[field], { ...completedDraft, work: compatibleWork, interrupted: undefined })
             const updated = { ...record, [field]: nextDraft,
               ...(finished ? { reviews: final.reviews, queued: false, loadPaused: false, cloudCacheHit: final.cached === true } : {}) }
             await tx.store.put(updated)
             await tx.done
             if (final) mergeGame(updated)
           } else await tx.done
+        }).catch(error => {
+          if (persisted === stamp) persisted = ''
+          throw error
         })
         return saving
       }
+      task.checkpoint = persist
       try {
         const selected = automatic ? { ...latest, options: settings.engine, compute: 'local' as const }
           : compute === 'cloud' ? { ...latest, draft: latest.cloudDraft } : latest
@@ -285,11 +328,11 @@ function App() {
               stageCount = next.stage === 'instant' ? next.instant : next.stage === 'critical' ? next.criticalDone : next.checked
             }
             publish(transition)
-            if (transition || now - lastPaint >= 225 || next.instant === next.moves + 1 && next.stage === 'instant') {
+            if (transition || now - lastPaint >= 450 || next.instant === next.moves + 1 && next.stage === 'instant') {
               updateLiveReview({ id, draft: copy(draft) })
               lastPaint = now
             }
-            if (now - lastSave >= 800 || transition && next.stage !== 'instant') await persist()
+            if (now - lastSave >= 2500 || transition && next.stage !== 'instant') await persist()
         }
         const onTelemetry = (sample: PoolStatus) => {
           const transition = telemetry?.paused !== sample.paused
@@ -306,8 +349,8 @@ function App() {
           const tx = (await db).transaction('games', 'readwrite')
           const record = await tx.store.get(id)
           if (record && record.queuedAt === queuedAt) {
-            if (!automatic && compute === 'cloud' && record.queueSource === 'auto' && error instanceof CloudUnavailable) {
-              const update = { ...record, ...prepareAnalysis(record, record.mode ?? settings.mode, settings.engine),
+            if (compute === 'cloud' && record.queueSource === 'auto' && error instanceof CloudUnavailable && error.rejectedBeforeStart) {
+              const update = { ...record, ...prepareAnalysis(record, mode, settings.engine),
                 queuedAt: Math.max(Date.now(), (queuedAt ?? 0) + 1) }
               if (isComplete(update)) update.queued = false
               await tx.store.put(update)
@@ -332,7 +375,7 @@ function App() {
       updateProgress(undefined)
       setActive(undefined)
     })
-  }, [games, sorted, visible, active, settings.autoPreview, settings.engine, settings.mode, settings.computeSource])
+  }, [games, sorted, visible, active, settings.autoPreview, settings.engine, settings.mode, settings.computeSource, batteryLow, batteryReady])
 
   const open = useCallback((game: Game, ply?: number) => { window.location.hash = 'review/' + game.id + (ply ? '/' + ply : '') }, [])
   function go(page: Page) { window.location.hash = page }
@@ -360,15 +403,20 @@ function App() {
         selections.set(game.id, chooseCompute(source, game, mode, status))
       }
       if (!selections.size) return
-      if (deviceCapabilities().mobile && [...selections.values()].includes('local')) {
-        const first = !localStorage.getItem('chessmind-mobile-local-warning')
+      const needsLocal = items.some(game => selections.get(game.id) === 'local' &&
+        !isComplete({ ...game, ...prepareAnalysis(game, mode, localOptions(game)) }))
+      if (needsLocal) {
+        const first = deviceCapabilities().mobile && !localStorage.getItem('chessmind-mobile-local-warning')
         const warning = [
           first && mobileWarning,
           mode === 'deep-review' && deepWarning,
+          !eco && settings.engine?.energy === 'turbo' && turboWarning,
+          settings.engine?.full && fullWarning,
         ].filter(Boolean).join('.\n\n')
         if (warning && !window.confirm(warning + '.')) return
         if (first) localStorage.setItem('chessmind-mobile-local-warning', '1')
       }
+      if (current.current && selections.has(current.current.id)) await current.current.checkpoint?.()
       const tx = (await db).transaction('games', 'readwrite')
       const changed = new Map<string, Game>()
       const queuedAt = Date.now()
@@ -397,7 +445,11 @@ function App() {
   async function pause(game: Game) {
     try {
       localStorage.setItem(stopKey(game), stopRevision(game))
-      if (current.current?.id === game.id) current.current.controller.abort()
+      const task = current.current
+      if (task?.id === game.id) {
+        task.controller.abort()
+        await task.checkpoint?.()
+      }
       mergeGame(await persistPause(game))
       notifyQueue({ id: game.id })
     } catch { setStatus('Не удалось приостановить анализ.') }
@@ -415,7 +467,7 @@ function App() {
       <a href="#home" className="brand"><img src="/icon.svg" width="43" height="43" alt="" /><div>Chess<span>Mind</span><small>АНАЛИЗ ПАРТИЙ</small></div></a>
       <nav aria-label="Основные разделы" className="main-nav">{navigation(core)}</nav>
       <nav aria-label="Дополнительные разделы" className="secondary-nav">{navigation(secondary)}</nav>
-      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0.6</small></div>
+      <div className="side-footer"><div><ShieldCheck size={16} /> Данные на устройстве</div><small>ChessMind 2.0.7</small></div>
     </aside>
     <main>
       <header className="topbar">
@@ -441,7 +493,7 @@ function App() {
         }}>Обновить</button></div>}
         {location.page === 'home' && <>
           <section className="hero">
-            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0.6</div>
+            <div className="hero-copy"><div className="eyebrow"><i /> CHESSMIND 2.0.7</div>
               <h1>Разбор шахматных<br className="desktop-break" /> партий</h1>
               <p>Найдите переломные ходы, проверьте варианты Stockfish и потренируйтесь на собственных ошибках.</p>
               <div className="hero-actions"><a className="primary" href="#games"><ArrowDownToLine size={18} /> Добавить партию</a>
@@ -465,7 +517,7 @@ function App() {
           <footer className="home-footer"><span><Cpu size={16} /> Все расчёты на вашем устройстве</span><span><Zap size={16} /> Бесплатно и без лимитов</span><span><MonitorDown size={16} /> Устанавливается как приложение</span></footer>
         </>}
         {location.page === 'games' && <>{importForm}<GameList games={sorted} nickname={settings.nickname} open={open} queue={items => void queueBatch(items, settings.mode)} /></>}
-        {location.page === 'review' && <ReviewScreen key={(selected?.id ?? '') + ':' + (location.ply ?? 0)} game={selected} initialPly={location.ply} games={games} nickname={settings.nickname} mode={settings.mode} active={active} options={settings.engine} preferredSource={settings.computeSource ?? 'auto'} onQueue={queue} onPause={pause} onImport={() => go('games')} />}
+        {location.page === 'review' && <ReviewScreen key={(selected?.id ?? '') + ':' + (location.ply ?? 0)} game={selected} initialPly={location.ply} games={games} nickname={settings.nickname} mode={settings.mode} active={active} options={settings.engine} batteryLow={batteryLow} preferredSource={settings.computeSource ?? 'auto'} onQueue={queue} onPause={pause} onImport={() => go('games')} />}
         <Suspense fallback={<p role="status">Загружаем раздел…</p>}>
         {location.page === 'training' && <Training games={games} nickname={settings.nickname} practice={practice} onPractice={item => setPractice(old => [...old.filter(entry => entry.id !== item.id), item])} onImport={() => go('games')} />}
         {location.page === 'stats' && <Statistics games={games} nickname={settings.nickname} open={open} />}
@@ -512,24 +564,34 @@ function GameList({ games, nickname, open, queue }: { games: Game[]; nickname: s
 
 function prepareAnalysis(game: Game, mode: Mode, options?: EngineOptions, compute: ComputeEngine = 'local'): Partial<Game> {
   const next = { mode, options, compute, methodology: methodologyVersion } as const
+  const key = analysisKey(next)
+  const current = analysisKey(game)
   const field = compute === 'cloud' ? 'cloudDraft' : 'draft'
   const oldDraft = game[field]
   const savedDrafts = { ...game.savedDrafts }
   const priorKey = oldDraft?.work?.profile ?? oldDraft?.interrupted?.profile
-  if (priorKey && priorKey !== analysisKey(next) && oldDraft) savedDrafts[priorKey] = oldDraft
-  const restored = savedDrafts[analysisKey(next)]
-  if (restored) delete savedDrafts[analysisKey(next)]
-  const draftPatch = { [field]: restored ?? oldDraft, savedDrafts }
-  if (analysisKey(game) === analysisKey(next)) return { ...next, ...draftPatch, queued: true }
-  const key = analysisKey(next)
+  if (priorKey && !compatibleAnalysisKeys(priorKey, key) && oldDraft) savedDrafts[priorKey] = oldDraft
+  const restoredKey = priorKey && compatibleAnalysisKeys(priorKey, key) ? undefined :
+    Object.keys(savedDrafts).find(profile => compatibleAnalysisKeys(profile, key))
+  const draft = (restoredKey ? savedDrafts[restoredKey] : undefined) ?? oldDraft
+  if (restoredKey) delete savedDrafts[restoredKey]
+  const draftPatch = { [field]: draft && {
+    ...draft,
+    work: draft.work && compatibleAnalysisKeys(draft.work.profile, key) ? { ...draft.work, profile: key } : draft.work,
+    interrupted: draft.interrupted && compatibleAnalysisKeys(draft.interrupted.profile, key)
+      ? { ...draft.interrupted, profile: key } : draft.interrupted,
+  }, savedDrafts }
+  if (compatibleAnalysisKeys(current, key)) return { ...next, ...draftPatch, queued: true }
   const saved = game.savedAnalyses ?? []
-  const snapshot = saved.find(item => analysisKey(item) === key)
+  const snapshot = saved.find(item => compatibleAnalysisKeys(analysisKey(item), key) && isComplete({ ...game, reviews: item.reviews }))
+    ?? saved.find(item => analysisKey(item) === key)
+  const discardedKey = snapshot && analysisKey(snapshot)
   const prior: Analysis[] = game.reviews?.length && game.mode ? [{
     mode: game.mode, methodology: game.methodology, options: game.options, compute: game.compute, reviews: game.reviews,
   }] : []
   return {
     ...next, ...draftPatch, queued: true, reviews: snapshot?.reviews ?? [],
-    savedAnalyses: [...saved.filter(item => ![key, analysisKey(game)].includes(analysisKey(item))), ...prior],
+    savedAnalyses: [...saved.filter(item => ![key, current, discardedKey].includes(analysisKey(item))), ...prior],
   }
 }
 

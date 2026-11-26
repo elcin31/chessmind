@@ -51,7 +51,30 @@ export const playerColor = (game: Game, nickname?: string): Color | undefined =>
   if (name === game.white.toLowerCase()) return 'w'
   if (name === game.black.toLowerCase()) return 'b'
 }
-export const isComplete = (game: Game) => !!game.reviews && game.reviews.length === game.moves
+// Energy and pool size schedule searches. The requested quality and engine options
+// are still part of the key, and individual positions use the actual UCI configuration.
+export function compatibleAnalysisKeys(a: string, b: string) {
+  const quality = (key: string) => /:local:stockfish-19\.0\.1:(?:eco|balanced|turbo):(?:auto|[1-4])$/.test(key)
+    ? key.split(':').slice(0, -2).join(':') : key
+  return a === b || quality(a) === quality(b)
+}
+
+const verifiedReviews = new WeakMap<Review[], boolean>()
+export function isComplete(game: Game) {
+  const { reviews, moves } = game
+  if (!moves || !reviews || reviews.length !== moves) return false
+  const previous = verifiedReviews.get(reviews)
+  if (previous !== undefined) return previous
+  let index = 0
+  for (const review of reviews) {
+    if (review?.index !== index++ || review.preliminary) {
+      verifiedReviews.set(reviews, false)
+      return false
+    }
+  }
+  verifiedReviews.set(reviews, true)
+  return true
+}
 export const displayDate = (date: string) => date ? new Date(date + 'T12:00:00').toLocaleDateString('ru-RU') : 'Дата неизвестна'
 
 export async function readGame(pgn: string, loadBook: () => Promise<Record<string, true | Opening>>,

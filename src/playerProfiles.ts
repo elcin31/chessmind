@@ -87,8 +87,8 @@ export function requestProfile(source: ProfileSource, name: string) {
       const now = Date.now()
       const until = profileRetryAt(source)
       if (until > now) return remember(key, stored, until)
-      if (!navigator.onLine) return remember(key, stored, now + 5000)
       if (nextRequest > now) await new Promise(resolve => setTimeout(resolve, nextRequest - now))
+      if (!navigator.onLine || document.hidden) return remember(key, stored, Date.now() + 5000)
       nextRequest = Date.now() + 800
       const route = source === 'chesscom' ? 'https://api.chess.com/pub/player/' : 'https://lichess.org/api/user/'
       try {

@@ -9,7 +9,10 @@ for (const file of files) hash.update(file).update(await readFile('dist' + file)
 const version = 'chessmind-' + hash.digest('hex').slice(0, 16)
 await writeFile('dist/sw.js', `
 const version = ${JSON.stringify(version)}
-const optional = new Set(['/engine/stockfish-19-single.js', '/engine/stockfish-19-single.wasm'])
+const optional = new Set([
+  '/engine/stockfish-19-single.js', '/engine/stockfish-19-single.wasm',
+  '/engine/stockfish-19-lite.js', '/engine/stockfish-19-lite.wasm',
+])
 const files = new Set(${JSON.stringify(files)})
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(version).then(cache => cache.addAll([...files].filter(path => !optional.has(path)))))

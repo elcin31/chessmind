@@ -102,6 +102,10 @@ test('реальный Stockfish Full по запросу и продолжен�
   await page.getByRole('button', { name: 'Импортировать PGN' }).click()
   await page.getByRole('button', { name: /White – Black/ }).click()
   await page.getByRole('combobox', { name: 'Тип разбора' }).selectOption('smart')
+  page.once('dialog', async dialog => {
+    expect(dialog.message()).toContain('Stockfish Full использует больше памяти')
+    await dialog.accept()
+  })
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByRole('heading', { name: /Итоги партии/ })).toBeVisible({ timeout: 125_000 })
   await page.getByRole('button', { name: 'Вперёд' }).click()

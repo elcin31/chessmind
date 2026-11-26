@@ -8,6 +8,7 @@ test('Instant доступен сразу, пауза и смена режима
   await page.getByRole('button', { name: 'Импортировать PGN' }).click()
   await page.getByRole('button', { name: /Morphy – Duke/ }).click()
   await page.getByRole('combobox', { name: 'Тип разбора' }).selectOption('deep-review')
+  page.once('dialog', dialog => dialog.accept())
   await page.getByRole('button', { name: 'Начать анализ' }).click()
   await expect(page.getByText('Предварительный проход завершён')).toBeVisible({ timeout: 20_000 })
   await expect(page.getByRole('heading', { name: /График партии · предварительный/ })).toBeVisible()

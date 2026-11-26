@@ -2,12 +2,12 @@ import { Chess, type Color, type Move, type Square } from 'chess.js'
 import { memo, useEffect, useId, useMemo, useRef, useState } from 'react'
 
 type Props = {
-  fen: string; orientation?: Color; last?: Move; accent?: string; arrows?: string[];
+  fen: string; orientation?: Color; last?: Move; accent?: string; arrows?: string[]; animate?: boolean;
   onSwipe?: (direction: -1 | 1) => void
   onMove?: (from: Square, to: Square, promotion?: string) => void
 }
 
-export const Board = memo(function Board({ fen, orientation = 'w', last, accent, arrows = [], onSwipe, onMove }: Props) {
+export const Board = memo(function Board({ fen, orientation = 'w', last, accent, arrows = [], onSwipe, onMove, animate = true }: Props) {
   const chess = useMemo(() => new Chess(fen), [fen])
   const [selection, select] = useState<{ fen: string; square: Square }>()
   const [promotion, promote] = useState<{ fen: string; from: Square; to: Square }>()
@@ -17,7 +17,7 @@ export const Board = memo(function Board({ fen, orientation = 'w', last, accent,
   const board = useRef<HTMLDivElement>(null)
   const swipe = useRef<{ x: number; y: number }>(undefined)
   useEffect(() => {
-    if (!last || !board.current || matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    if (!animate || !last || !board.current || matchMedia('(prefers-reduced-motion: reduce)').matches) return
     const image = board.current.querySelector<HTMLImageElement>('[data-square="' + last.to + '"] img')
     if (!image) return
     const sign = orientation === 'w' ? 1 : -1
@@ -28,14 +28,16 @@ export const Board = memo(function Board({ fen, orientation = 'w', last, accent,
     const motion = image.animate([{ transform: 'translate(' + dx * size + 'px,' + dy * size + 'px)' }, { transform: 'translate(0,0)' }],
       { duration: 145, easing: 'ease-out' })
     return () => motion.cancel()
-  }, [last, orientation])
+  }, [last, orientation, animate])
   const id = useId().replace(/[^a-zA-Z0-9-]/g, '')
   const selected = selection?.fen === fen ? selection.square : undefined
   const choices = promotion?.fen === fen ? promotion : undefined
-  const squares = chess.board().flatMap((row, rank) => row.map((piece, file) => ({
-    piece, rank, file, square: (String.fromCharCode(97 + file) + (8 - rank)) as Square,
-  })))
-  if (orientation === 'b') squares.reverse()
+  const squares = useMemo(() => {
+    const items = chess.board().flatMap((row, rank) => row.map((piece, file) => ({
+      piece, rank, file, square: (String.fromCharCode(97 + file) + (8 - rank)) as Square,
+    })))
+    return orientation === 'b' ? items.reverse() : items
+  }, [chess, orientation])
   const targets = selected && onMove ? chess.moves({ square: selected, verbose: true }) : []
   function attempt(from: Square, to: Square) {
     const moves = chess.moves({ square: from, verbose: true }).filter(move => move.to === to)

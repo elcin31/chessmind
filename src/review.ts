@@ -1,6 +1,6 @@
 import { Chess, type Color, type Move, type PieceSymbol, type Square } from 'chess.js'
 import type { Engine } from './engine.js'
-import type { Position } from './stockfish.js'
+import { positionFacts, type Position } from './stockfish.js'
 import { analysisKey, gameMoves, playUci, uci, type Game, type Mode } from './game.js'
 import { explain } from './coach.js'
 import { drawState, positionKey } from './rules.js'
@@ -147,7 +147,8 @@ export function positionsFor(game: Game, moves: Move[]) {
   const seen = new Map([[positionKey(game.initial), 1]])
   let initial = game.initial
   let played: string[] = []
-  const positions: Position[] = [{ initial, moves: [], fen: initial, legal: new Chess(initial).perft(1) }]
+  const first = positionFacts(initial)
+  const positions: Position[] = [{ initial, moves: [], fen: initial, legal: first.legal, facts: first }]
   for (const move of moves) {
     const key = positionKey(move.after)
     const repetitions = (seen.get(key) ?? 0) + 1
@@ -158,7 +159,8 @@ export function positionsFor(game: Game, moves: Move[]) {
       initial = move.after
       played = []
     } else played.push(uci(move))
-    positions.push({ initial, moves: [...played], fen: move.after, repetitions, legal: new Chess(move.after).perft(1) })
+    const facts = positionFacts(move.after, repetitions)
+    positions.push({ initial, moves: [...played], fen: move.after, repetitions, legal: facts.legal, facts })
   }
   return positions
 }
@@ -171,7 +173,7 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
   const move = moves[index]
   const notation = uci(move)
   const current = positions[index], child = positions[index + 1]
-  const terminal = drawState(new Chess(move.after), child.repetitions, child.legal)
+  const terminal = child.facts ? child.facts.draw : drawState(new Chess(move.after), child.repetitions, child.legal)
   const lite = mode === 'lite'
   let root = historyRoot ?? { lines: await engine.evaluate(current, mode, force), deep: force }
   async function compare() {
@@ -179,9 +181,11 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
     const inMulti = root.lines.find(line => line.pv[0] === notation)
     if (inMulti || !best.pv.length) return { best, played: inMulti ?? best }
     const search = async (move: string, depth: number) => (await engine.evaluate(current, mode, root.deep, move, depth))[0]
+    const pairedSearch = () => engine.evaluate(current, mode, root.deep, [best.pv[0], notation], best.depth)
+    let paired: Line[] | undefined
     if (adaptive) {
       // Compare both candidates at one root and one completed MultiPV iteration.
-      const paired = await engine.evaluate(current, mode, root.deep, [best.pv[0], notation], best.depth)
+      paired = await pairedSearch()
       const baseline = paired.find(line => line.pv[0] === best.pv[0])
       const candidate = paired.find(line => line.pv[0] === notation)
       if (baseline && candidate) return { best: baseline, played: candidate }
@@ -193,12 +197,12 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
     if (!force && played.depth === best.depth && (sameKind && best.kind === 'cp' || mateAgrees)) return { best, played }
 
     // Lower depth or a different mate assessment needs a common independent check.
-    const paired = await engine.evaluate(current, mode, root.deep, [best.pv[0], notation], best.depth)
+    paired ??= await pairedSearch()
     const baseline = paired.find(line => line.pv[0] === best.pv[0])!
     const candidate = paired.find(line => line.pv[0] === notation)!
-    const agrees = baseline.kind === best.kind &&
+    const agrees = baseline && candidate && baseline.kind === best.kind &&
       (best.kind === 'mate' ? Math.sign(baseline.value) === Math.sign(best.value) : Math.abs(baseline.value - best.value) <= 35)
-    if (baseline.depth >= best.depth && agrees) return { best: baseline, played: candidate }
+    if (agrees && baseline.depth >= best.depth) return { best: baseline, played: candidate }
 
     const reference = await search(best.pv[0], Math.min(best.depth, played.depth))
     const independent = reference.depth < played.depth ? await search(notation, reference.depth) : played
@@ -275,11 +279,12 @@ export async function analyzeMove(game: Game, mode: Mode, engine: Pick<Engine, '
 }
 
 export async function recheckMove(game: Game, index: number, signal: AbortSignal) {
-  const { Engine } = await import('./engine.js')
+  const { SearchPool, poolConfiguration } = await import('./searchPool.js')
   const moves = gameMoves(game)
-  const engine = new Engine(signal, game.options, undefined, game.id)
-  try { return (await analyzeMove(game, 'professional', engine, index, moves, positionsFor(game, moves), undefined, true)).review }
-  finally { engine.close(); await engine.flush() }
+  const options = { ...game.options, workers: 1 as const }
+  const pool = new SearchPool(signal, game.id, options, await poolConfiguration(options), () => {}, undefined, true)
+  try { return (await analyzeMove(game, 'professional', pool.at(index), index, moves, positionsFor(game, moves), undefined, true)).review }
+  finally { await pool.close() }
 }
 
 export function average(values: number[]) {

@@ -339,3 +339,10 @@ td:first-child { color: var(--text); }
 .preview-summary { background: var(--soft); padding: .55rem .7rem; border-radius: .5rem; width: 100%; }
 .preview-summary button { margin-inline-start: auto; min-height: 34px; }
 .analysis-finished { font-size: .83rem; margin: 0; color: var(--muted); }
+.review-layout[data-analyzing] .eval-bar div { transition: none; }
+.run-controls { min-width: 0; max-width: 100%; }
+.run-controls button,.board-controls button { touch-action: manipulation; }
+@media (pointer: coarse) {
+  .run-controls button,.board-controls button,.preview-summary button { min-height: 44px; }
+  .board-controls button { width: 44px; }
+}
